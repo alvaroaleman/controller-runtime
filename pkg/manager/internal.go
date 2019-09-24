@@ -18,7 +18,6 @@ package manager
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -362,10 +361,6 @@ func (cm *controllerManager) startLeaderElection() (err error) {
 				cm.startLeaderElectionRunnables()
 			},
 			OnStoppedLeading: func() {
-				// Most implementations of leader election log.Fatal() here.
-				// Since Start is wrapped in log.Fatal when called, we can just return
-				// an error here which will cause the program to exit.
-				cm.errChan <- fmt.Errorf("leader election lost")
 			},
 		},
 	})
