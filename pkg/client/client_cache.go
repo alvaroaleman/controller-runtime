@@ -30,6 +30,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
+type restMapper interface {
+	RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error)
+}
+
 // clientCache creates and caches rest clients and metadata for Kubernetes types.
 type clientCache struct {
 	// config is the rest.Config to talk to an apiserver
@@ -39,7 +43,7 @@ type clientCache struct {
 	scheme *runtime.Scheme
 
 	// mapper maps GroupVersionKinds to Resources
-	mapper meta.RESTMapper
+	mapper restMapper
 
 	// codecs are used to create a REST client for a gvk
 	codecs serializer.CodecFactory

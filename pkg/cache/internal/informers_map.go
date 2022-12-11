@@ -49,7 +49,7 @@ type createListWatcherFunc func(gvk schema.GroupVersionKind, ip *specificInforme
 // the generical InformersMap, except that it doesn't implement WaitForCacheSync).
 func newSpecificInformersMap(config *rest.Config,
 	scheme *runtime.Scheme,
-	mapper meta.RESTMapper,
+	mapper restMapper,
 	resync time.Duration,
 	namespace string,
 	selectors SelectorsByGVK,
@@ -94,7 +94,7 @@ type specificInformersMap struct {
 	config *rest.Config
 
 	// mapper maps GroupVersionKinds to Resources
-	mapper meta.RESTMapper
+	mapper restMapper
 
 	// informersByGVK is the cache of informers keyed by groupVersionKind
 	informersByGVK map[schema.GroupVersionKind]*MapEntry

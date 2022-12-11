@@ -106,13 +106,17 @@ type ObjectSelector internal.Selector
 // a more specific setting here, if any).
 type SelectorsByObject map[client.Object]ObjectSelector
 
+type restMapper interface {
+	RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error)
+}
+
 // Options are the optional arguments for creating a new InformersMap object.
 type Options struct {
 	// Scheme is the scheme to use for mapping objects to GroupVersionKinds
 	Scheme *runtime.Scheme
 
 	// Mapper is the RESTMapper to use for mapping GroupVersionKinds to Resources
-	Mapper meta.RESTMapper
+	Mapper restMapper
 
 	// Resync is the base frequency the informers are resynced.
 	// Defaults to defaultResyncTime.
@@ -251,7 +255,7 @@ func combineScheme(schemes ...*runtime.Scheme) *runtime.Scheme {
 	return out
 }
 
-func selectMapper(def, override meta.RESTMapper) meta.RESTMapper {
+func selectMapper(def, override restMapper) restMapper {
 	if override != nil {
 		return override
 	}

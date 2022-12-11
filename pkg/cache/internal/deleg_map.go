@@ -43,11 +43,15 @@ type InformersMap struct {
 	Scheme *runtime.Scheme
 }
 
+type restMapper interface {
+	RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error)
+}
+
 // NewInformersMap creates a new InformersMap that can create informers for
 // both structured and unstructured objects.
 func NewInformersMap(config *rest.Config,
 	scheme *runtime.Scheme,
-	mapper meta.RESTMapper,
+	mapper restMapper,
 	resync time.Duration,
 	namespace string,
 	selectors SelectorsByGVK,
@@ -108,19 +112,19 @@ func (m *InformersMap) Get(ctx context.Context, gvk schema.GroupVersionKind, obj
 }
 
 // newStructuredInformersMap creates a new InformersMap for structured objects.
-func newStructuredInformersMap(config *rest.Config, scheme *runtime.Scheme, mapper meta.RESTMapper, resync time.Duration,
+func newStructuredInformersMap(config *rest.Config, scheme *runtime.Scheme, mapper restMapper, resync time.Duration,
 	namespace string, selectors SelectorsByGVK, disableDeepCopy DisableDeepCopyByGVK, transformers TransformFuncByObject) *specificInformersMap {
 	return newSpecificInformersMap(config, scheme, mapper, resync, namespace, selectors, disableDeepCopy, transformers, createStructuredListWatch)
 }
 
 // newUnstructuredInformersMap creates a new InformersMap for unstructured objects.
-func newUnstructuredInformersMap(config *rest.Config, scheme *runtime.Scheme, mapper meta.RESTMapper, resync time.Duration,
+func newUnstructuredInformersMap(config *rest.Config, scheme *runtime.Scheme, mapper restMapper, resync time.Duration,
 	namespace string, selectors SelectorsByGVK, disableDeepCopy DisableDeepCopyByGVK, transformers TransformFuncByObject) *specificInformersMap {
 	return newSpecificInformersMap(config, scheme, mapper, resync, namespace, selectors, disableDeepCopy, transformers, createUnstructuredListWatch)
 }
 
 // newMetadataInformersMap creates a new InformersMap for metadata-only objects.
-func newMetadataInformersMap(config *rest.Config, scheme *runtime.Scheme, mapper meta.RESTMapper, resync time.Duration,
+func newMetadataInformersMap(config *rest.Config, scheme *runtime.Scheme, mapper restMapper, resync time.Duration,
 	namespace string, selectors SelectorsByGVK, disableDeepCopy DisableDeepCopyByGVK, transformers TransformFuncByObject) *specificInformersMap {
 	return newSpecificInformersMap(config, scheme, mapper, resync, namespace, selectors, disableDeepCopy, transformers, createMetadataListWatch)
 }

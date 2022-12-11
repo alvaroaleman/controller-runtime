@@ -77,7 +77,7 @@ func MultiNamespacedCacheBuilder(namespaces []string) NewCacheFunc {
 type multiNamespaceCache struct {
 	namespaceToCache map[string]Cache
 	Scheme           *runtime.Scheme
-	RESTMapper       apimeta.RESTMapper
+	RESTMapper       restMapper
 	clusterCache     Cache
 }
 

@@ -80,6 +80,7 @@ func NewDynamicRESTMapper(cfg *rest.Config, opts ...DynamicRESTMapperOption) (me
 	if err != nil {
 		return nil, err
 	}
+
 	drm := &dynamicRESTMapper{
 		limiter: rate.NewLimiter(rate.Limit(defaultRefillRate), defaultLimitSize),
 		newMapper: func() (meta.RESTMapper, error) {
