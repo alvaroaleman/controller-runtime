@@ -138,7 +138,7 @@ func applyGetOptions(opts ...InformerGetOption) *internal.GetOptions {
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	return (*internal.GetOptions)(cfg)
+	return cfg
 }
 
 // GetInformerForKind returns the informer for the GroupVersionKind. If no informer exists, one will be started.
@@ -176,56 +176,6 @@ func (ic *informerCache) getInformerForKind(ctx context.Context, gvk schema.Grou
 		return false, nil, err
 	}
 	return started, cache, nil
-}
-
-func (ic *informerCache) SetMinimumRVForObject(obj client.Object, rv int64) error {
-	gvk, err := apiutil.GVKForObject(obj, ic.scheme)
-	if err != nil {
-		return fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
-	}
-	h := ic.Informers.GetConsistencyHandler(gvk, obj)
-	h.SetMinimumRV(client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, rv)
-	return nil
-}
-
-func (ic *informerCache) AddRequiredDeleteForObject(obj client.Object) error {
-	gvk, err := apiutil.GVKForObject(obj, ic.scheme)
-	if err != nil {
-		return err
-	}
-	cache, started, ok := ic.Peek(gvk, obj)
-	if !ok {
-		return fmt.Errorf("informer for GVK %v not found in cache", gvk)
-	}
-	if !started {
-		return &ErrCacheNotStarted{}
-	}
-	if !cache.Informer.HasSynced() {
-		return fmt.Errorf("informer for GVK %v is not synced", gvk)
-	}
-
-	cache.Reader.ConsistencyHandler.AddPendingDelete(
-		client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()},
-		obj.GetUID(),
-	)
-	return nil
-}
-
-func (ic *informerCache) RemoveRequiredDeleteForObject(obj client.Object) error {
-	gvk, err := apiutil.GVKForObject(obj, ic.scheme)
-	if err != nil {
-		return fmt.Errorf("failed to get GVK for object: %w", err)
-	}
-	cache, _, ok := ic.Peek(gvk, obj)
-	if !ok {
-		return fmt.Errorf("informer for GVK %v not found in cache", gvk)
-	}
-	cache.Reader.ConsistencyHandler.RemovePendingDelete(
-		client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()},
-		obj.GetUID(),
-	)
-
-	return nil
 }
 
 // RemoveInformer deactivates and removes the informer from the cache.

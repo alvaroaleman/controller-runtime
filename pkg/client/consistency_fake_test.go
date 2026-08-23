@@ -19,11 +19,7 @@ package client_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -33,117 +29,51 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/watch"
 	appsv1applyconfigurations "k8s.io/client-go/applyconfigurations/apps/v1"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/utils/ptr"
 
-	"k8s.io/apimachinery/pkg/api/meta/testrestmapper"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
-// watchDelay is how long the cache lags behind the fake client.
+// watchDelay is how long the fake cache lags behind the fake client.
 const watchDelay = 10 * time.Second
 
-// newConsistentFakeClient returns a consistent client that is backed by a fakeclient
-// and uses the real cache.
+// newConsistentFakeClient returns a consistent client backed by a fakeclient
+// and a fake cache that delivers events with a 10 second delay.
 func newConsistentFakeClient(
 	t *testing.T,
 	locker client.KeyLock,
-	opts cache.Options,
-	warmupFor client.Object,
 	initObjects ...client.Object,
 ) client.Client {
 	t.Helper()
 
+	fc := newFakeCache()
 	upstream := fake.NewClientBuilder().
 		WithGlobalResourceVersionCounter().
 		WithObjects(initObjects...).
+		WithInterceptorFuncs(fc.interceptorFuncs()).
 		Build()
 
-	opts.Scheme = scheme.Scheme
-	if opts.Mapper == nil {
-		opts.Mapper = testrestmapper.TestOnlyStaticRESTMapper(opts.Scheme)
-	}
-	// NB: Don't use t.Context() directly, it is cancelled before the cleanup
-	// functions run and the cache must outlive them.
-	ctx, cancel := context.WithCancel(context.WithoutCancel(t.Context()))
-
-	probe := &namespaceProber{}
-	opts.HTTPClient = &http.Client{Transport: probe}
-	opts.NewInformer = func(realLW toolscache.ListerWatcher, obj runtime.Object, resync time.Duration, indexers toolscache.Indexers) toolscache.SharedIndexInformer {
-		namespace, err := probe.namespaceFor(ctx, realLW)
-		if err != nil {
-			t.Errorf("failed to determine the namespace of the listwatcher for %T: %v", obj, err)
-		}
-		lw := &fakeListWatcher{ctx: ctx, client: upstream, scheme: opts.Scheme, obj: obj, namespace: namespace}
-		return toolscache.NewSharedIndexInformer(lw, obj, resync, indexers)
-	}
-	c, err := cache.New(&rest.Config{}, opts)
-	if err != nil {
-		t.Fatalf("failed to construct cache: %v", err)
-	}
-
-	// Prewarm the cache to make sure events get deliveted over the delayed
-	// watch and not the initial list and so deletes can work.
-	if _, err := c.GetInformer(t.Context(), warmupFor); err != nil {
-		t.Fatalf("failed to get informer for %T: %v", warmupFor, err)
-	}
-
-	consistencyCache, ok := c.(client.ConsistencyCache)
-	if !ok {
-		t.Fatalf("cache of type %T does not implement %T", c, client.ConsistencyCache(nil))
-	}
-
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		if err := c.Start(ctx); err != nil {
-			t.Errorf("cache failed: %v", err)
-		}
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-stopped
-	})
-
 	return client.NewConsistentClient(
-		&fakeConsistentClientUpstream{WithWatch: upstream, reader: c},
-		consistencyCache,
-		func() client.KeyLock {
-			return locker
-		},
+		&fakeConsistentClientUpstream{Client: upstream},
+		fc,
+		func() client.KeyLock { return locker },
 	)
 }
 
 type fakeConsistentClientUpstream struct {
-	client.WithWatch
-	reader client.Reader
+	client.Client
 }
 
-func (u *fakeConsistentClientUpstream) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	return u.reader.Get(ctx, key, obj, opts...)
-}
-
-func (u *fakeConsistentClientUpstream) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	return u.reader.List(ctx, list, opts...)
-}
-
-// DeleteWithResult returns what an apiserver returns for a delete: the object if it
-// is still in storage because it has finalizers, and a response without a resource
-// version if it is gone.
 func (u *fakeConsistentClientUpstream) DeleteWithResult(ctx context.Context, obj client.Object, opts ...client.DeleteOption) (*unstructured.Unstructured, error) {
-	if err := u.WithWatch.Delete(ctx, obj, opts...); err != nil {
+	if err := u.Delete(ctx, obj, opts...); err != nil {
 		return nil, err
 	}
 
@@ -153,7 +83,7 @@ func (u *fakeConsistentClientUpstream) DeleteWithResult(ctx context.Context, obj
 	}
 	result := &unstructured.Unstructured{}
 	result.SetGroupVersionKind(gvk)
-	if err := u.WithWatch.Get(ctx, client.ObjectKeyFromObject(obj), result); err != nil {
+	if err := u.Get(ctx, client.ObjectKeyFromObject(obj), result); err != nil {
 		if apierrors.IsNotFound(err) {
 			return &unstructured.Unstructured{}, nil
 		}
@@ -163,227 +93,151 @@ func (u *fakeConsistentClientUpstream) DeleteWithResult(ctx context.Context, obj
 	return result, nil
 }
 
-// namespaceProber is a http.RoundTripper that exists for the sole purpose
-// of extracting the namespace from a listwatcher.
-type namespaceProber struct {
-	lock sync.Mutex
-	path string
+// fakeCache delivers events to eventhandlers from a client using interceptorFuncs
+// with a fixed deploy.
+type fakeCache struct {
+	cacheapi.Informers
+
+	informer *fakeInformer
 }
 
-func (p *namespaceProber) RoundTrip(r *http.Request) (*http.Response, error) {
-	p.path = r.URL.Path
-	return nil, errors.New("request issued by the namespace probe")
+func newFakeCache() *fakeCache {
+	return &fakeCache{
+		informer: &fakeInformer{},
+	}
 }
 
-func (p *namespaceProber) namespaceFor(ctx context.Context, lw toolscache.ListerWatcher) (string, error) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	p.path = ""
-	_, err := toolscache.ToListerWatcherWithContext(lw).ListWithContext(ctx, metav1.ListOptions{})
-	if err == nil {
-		return "", fmt.Errorf("expected listing to fail for prober but didn't")
-	}
-
-	// Example path for a namespaced request: /apis/<group>/<version>/namespaces/<namespace>/<resource>
-	segments := strings.Split(strings.Trim(p.path, "/"), "/")
-	for idx, segment := range segments {
-		if segment == "namespaces" && idx+1 < len(segments)-1 {
-			return segments[idx+1], nil
-		}
-	}
-
-	return "", nil
+func (c *fakeCache) GetInformer(ctx context.Context, obj cacheapi.Object, opts ...cacheapi.InformerGetOption) (cacheapi.Informer, error) {
+	return c.informer, nil
 }
 
-// fakeListWatcher lists and watches a single kind from the fake client, in the
-// representation the informer it belongs to expects. It is restricted to namespace
-// if that is set.
-type fakeListWatcher struct {
-	ctx       context.Context
-	client    client.WithWatch
-	scheme    *runtime.Scheme
-	obj       runtime.Object
-	namespace string
-
-	lock sync.Mutex
-	// pending is the watch that was opened when the last list was taken.
-	pending watch.Interface
-}
-
-func (l *fakeListWatcher) List(_ metav1.ListOptions) (runtime.Object, error) {
-	list, err := l.newList()
-	if err != nil {
-		return nil, err
+func (c *fakeCache) interceptorFuncs() interceptor.Funcs {
+	notify := func(event func(h toolscache.ResourceEventHandler)) {
+		go func() {
+			time.Sleep(watchDelay)
+			c.informer.dispatch(event)
+		}()
 	}
 
-	var opts []client.ListOption
-	if l.namespace != "" {
-		opts = append(opts, client.InNamespace(l.namespace))
-	}
-
-	// Watch before listing. An object that ends up in both is harmless, one that
-	// ends up in neither would never reach the informer.
-	w, err := l.client.Watch(l.ctx, list, opts...)
-	if err != nil {
-		return nil, err
-	}
-	l.lock.Lock()
-	l.pending = newDelayedWatch(w, l.convert)
-	l.lock.Unlock()
-
-	if err := l.client.List(l.ctx, list, opts...); err != nil {
-		return nil, err
-	}
-
-	return list, nil
-}
-
-// newList returns the list type that matches the informers object type. The fake
-// client converts into whatever it is given, the informer is not that forgiving.
-func (l *fakeListWatcher) newList() (client.ObjectList, error) {
-	gvk, err := apiutil.GVKForObject(l.obj, l.scheme)
-	if err != nil {
-		return nil, err
-	}
-	listGVK := gvk.GroupVersion().WithKind(gvk.Kind + "List")
-
-	switch l.obj.(type) {
-	case runtime.Unstructured:
-		list := &unstructured.UnstructuredList{}
-		list.SetGroupVersionKind(listGVK)
-		return list, nil
-	case *metav1.PartialObjectMetadata:
-		list := &metav1.PartialObjectMetadataList{}
-		list.SetGroupVersionKind(listGVK)
-		return list, nil
-	default:
-		obj, err := l.scheme.New(listGVK)
+	notifyApply := func(ac runtime.ApplyConfiguration) {
+		updated := &appsv1.Deployment{}
+		data, err := json.Marshal(ac)
 		if err != nil {
-			return nil, err
+			panic(err)
 		}
-		return obj.(client.ObjectList), nil
-	}
-}
-
-func (l *fakeListWatcher) convert(obj runtime.Object) (runtime.Object, error) {
-	gvk, err := apiutil.GVKForObject(l.obj, l.scheme)
-	if err != nil {
-		return nil, err
-	}
-
-	switch l.obj.(type) {
-	case runtime.Unstructured:
-		content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
-		if err != nil {
-			return nil, err
+		if err := json.Unmarshal(data, updated); err != nil {
+			panic(err)
 		}
-		converted := &unstructured.Unstructured{Object: content}
-		converted.SetGroupVersionKind(gvk)
-		return converted, nil
-	case *metav1.PartialObjectMetadata:
-		content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
-		if err != nil {
-			return nil, err
-		}
-		converted := &metav1.PartialObjectMetadata{}
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(content, converted); err != nil {
-			return nil, err
-		}
-		converted.SetGroupVersionKind(gvk)
-		return converted, nil
-	default:
-		return obj, nil
+		notify(func(h toolscache.ResourceEventHandler) { h.OnUpdate(nil, updated) })
+	}
+
+	return interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if err := cl.Create(ctx, obj, opts...); err != nil {
+				return err
+			}
+			notify(func(h toolscache.ResourceEventHandler) { h.OnAdd(obj, false) })
+			return nil
+		},
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if err := cl.Update(ctx, obj, opts...); err != nil {
+				return err
+			}
+			notify(func(h toolscache.ResourceEventHandler) { h.OnUpdate(nil, obj) })
+			return nil
+		},
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if err := cl.Patch(ctx, obj, patch, opts...); err != nil {
+				return err
+			}
+			notify(func(h toolscache.ResourceEventHandler) { h.OnUpdate(nil, obj) })
+			return nil
+		},
+		Apply: func(ctx context.Context, cl client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+			if err := cl.Apply(ctx, obj, opts...); err != nil {
+				return err
+			}
+			notifyApply(obj)
+			return nil
+		},
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if err := cl.Delete(ctx, obj, opts...); err != nil {
+				return err
+			}
+
+			// the fake client doesn't update the passed obj on delete, so fetch it
+			// and if that returns something, use it for the event.
+			result := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), result); err != nil {
+				if !apierrors.IsNotFound(err) {
+					panic(err)
+				}
+				notify(func(h toolscache.ResourceEventHandler) { h.OnDelete(obj) })
+				return nil
+			}
+			notify(func(h toolscache.ResourceEventHandler) { h.OnUpdate(nil, result) })
+			return nil
+		},
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if err := cl.SubResource(subResourceName).Update(ctx, obj, opts...); err != nil {
+				return err
+			}
+			notify(func(h toolscache.ResourceEventHandler) { h.OnUpdate(nil, obj) })
+			return nil
+		},
+		SubResourcePatch: func(ctx context.Context, cl client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if err := cl.SubResource(subResourceName).Patch(ctx, obj, patch, opts...); err != nil {
+				return err
+			}
+			notify(func(h toolscache.ResourceEventHandler) { h.OnUpdate(nil, obj) })
+			return nil
+		},
+		SubResourceApply: func(ctx context.Context, cl client.Client, subResourceName string, obj runtime.ApplyConfiguration, opts ...client.SubResourceApplyOption) error {
+			if err := cl.SubResource(subResourceName).Apply(ctx, obj, opts...); err != nil {
+				return err
+			}
+			notifyApply(obj)
+			return nil
+		},
 	}
 }
 
-func (l *fakeListWatcher) Watch(opts metav1.ListOptions) (watch.Interface, error) {
-	if opts.SendInitialEvents != nil {
-		// Streaming lists are not supported, this makes the reflector fall back
-		// to listing and then watching.
-		return nil, errors.New("streaming lists are not supported")
-	}
+type fakeInformer struct {
+	cacheapi.Informer
 
-	l.lock.Lock()
-	defer l.lock.Unlock()
-
-	w := l.pending
-	l.pending = nil
-
-	return w, nil
+	mu       sync.Mutex
+	handlers []toolscache.ResourceEventHandler
 }
 
-func newDelayedWatch(upstream watch.Interface, convert func(runtime.Object) (runtime.Object, error)) watch.Interface {
-	w := &delayedWatch{
-		upstream: upstream,
-		convert:  convert,
-		out:      make(chan watch.Event),
-		stop:     make(chan struct{}),
-	}
-	go w.forward()
-
-	return w
+func (i *fakeInformer) AddEventHandler(handler toolscache.ResourceEventHandler) (toolscache.ResourceEventHandlerRegistration, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.handlers = append(i.handlers, handler)
+	return fakeRegistration{}, nil
 }
 
-// delayedWatch delivers the events of another watch with a delay.
-type delayedWatch struct {
-	upstream watch.Interface
-	convert  func(runtime.Object) (runtime.Object, error)
-	out      chan watch.Event
-	stop     chan struct{}
-	stopOnce sync.Once
-}
-
-func (w *delayedWatch) forward() {
-	defer close(w.out)
-
-	for event := range w.upstream.ResultChan() {
-		converted, err := w.convert(event.Object)
-		if err != nil {
-			panic(fmt.Sprintf("failed to convert %T: %v", event.Object, err))
-		}
-		event.Object = converted
-
-		time.Sleep(watchDelay)
-		select {
-		case w.out <- event:
-		case <-w.stop:
-			return
-		}
+func (i *fakeInformer) dispatch(event func(h toolscache.ResourceEventHandler)) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	for _, h := range i.handlers {
+		event(h)
 	}
 }
 
-func (w *delayedWatch) ResultChan() <-chan watch.Event { return w.out }
-
-func (w *delayedWatch) Stop() {
-	w.stopOnce.Do(func() {
-		close(w.stop)
-		w.upstream.Stop()
-	})
+type fakeRegistration struct {
+	toolscache.ResourceEventHandlerRegistration
 }
 
-type clusterScopedRESTMapper struct {
-	meta.RESTMapper
+func (fakeRegistration) HasSyncedChecker() toolscache.DoneChecker { return fakeDoneChecker{} }
+
+type fakeDoneChecker struct {
+	toolscache.DoneChecker
 }
 
-func (c clusterScopedRESTMapper) RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
-	mapping, err := c.RESTMapper.RESTMapping(gk, versions...)
-	if err != nil {
-		return nil, err
-	}
-	mapping.Scope = meta.RESTScopeRoot
-	return mapping, nil
-}
-
-func (c clusterScopedRESTMapper) RESTMappings(gk schema.GroupKind, versions ...string) ([]*meta.RESTMapping, error) {
-	mappings, err := c.RESTMapper.RESTMappings(gk, versions...)
-	if err != nil {
-		return nil, err
-	}
-	for _, mapping := range mappings {
-		mapping.Scope = meta.RESTScopeRoot
-	}
-	return mappings, nil
+func (fakeDoneChecker) Done() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
 }
 
 type keyLockerWithLockCallback struct {
@@ -399,126 +253,25 @@ func (k *keyLockerWithLockCallback) Lock(ctx context.Context) error {
 
 // TestConsistentFakeClient uses a callback on the Lock acquisition of a write operation
 // to start a read operation, then validates the read operation observes the write.
-// It uses a fake informer with a hardcoded 10 second delay on the watch in synctest to
-// avoid actually having to wait 10 seconds.
+// It uses a fake cache with a fixed ten seconds delay in synctest, to avoid having to
+// wait ten seconds of wallclock time.
 //
-// It tests the cross product of:
-// * Cluster-scoped and namespaced objects
-// * Default and multi-namespace cache
-// * Typed and unstructured representations
-// * All write operations
-// * Get and List
+// It tests the cross product of all write operations and get and list.
 func TestConsistentFakeClient(t *testing.T) {
 	t.Parallel()
 
-	scopes := []struct {
-		name      string
-		namespace string
-	}{
-		{
-			name:      "namespaced object",
-			namespace: "default",
-		},
-		{
-			name: "cluster-scoped object",
-		},
-	}
+	const namespace = "default"
 
-	for _, scope := range scopes {
-		t.Run(scope.name, func(t *testing.T) {
-			t.Parallel()
-			testConsistentFakeClient(t, scope.namespace)
-		})
-	}
-}
-
-func testConsistentFakeClient(t *testing.T, namespace string) {
-	typedDeployment := func() *appsv1.Deployment {
+	deployment := func() *appsv1.Deployment {
 		return &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: namespace, UID: "test-uid"},
 		}
 	}
 
-	representations := []struct {
-		name       string
-		deployment func() client.Object
-	}{
-		{
-			name:       "typed",
-			deployment: func() client.Object { return typedDeployment() },
-		},
-		{
-			name: "unstructured",
-			deployment: func() client.Object {
-				u := mustToUnstructured(typedDeployment())
-				u.SetGroupVersionKind(appsv1.SchemeGroupVersion.WithKind("Deployment"))
-				return u
-			},
-		},
-		{
-			name: "partial object metadata",
-			deployment: func() client.Object {
-				partial := &metav1.PartialObjectMetadata{ObjectMeta: typedDeployment().ObjectMeta}
-				partial.SetGroupVersionKind(appsv1.SchemeGroupVersion.WithKind("Deployment"))
-				return partial
-			},
-		},
-	}
-
-	for _, representation := range representations {
-		t.Run(representation.name, func(t *testing.T) {
-			t.Parallel()
-			testConsistentFakeClientForRepresentation(t, namespace, representation.deployment)
-		})
-	}
-}
-
-func testConsistentFakeClientForRepresentation(t *testing.T, namespace string, deployment func() client.Object) {
-	mapper := testrestmapper.TestOnlyStaticRESTMapper(scheme.Scheme)
-	if namespace == "" {
-		mapper = clusterScopedRESTMapper{mapper}
-	}
-
-	_, isUnstructured := deployment().(*unstructured.Unstructured)
-	_, isPartialMetadata := deployment().(*metav1.PartialObjectMetadata)
-
-	deploymentWithFinalizer := func() client.Object {
+	deploymentWithFinalizer := func() *appsv1.Deployment {
 		d := deployment()
 		d.SetFinalizers([]string{"test.io/finalizer"})
 		return d
-	}
-
-	deploymentList := func() client.ObjectList {
-		if isPartialMetadata {
-			list := &metav1.PartialObjectMetadataList{}
-			list.SetGroupVersionKind(appsv1.SchemeGroupVersion.WithKind("DeploymentList"))
-			return list
-		}
-		if !isUnstructured {
-			return &appsv1.DeploymentList{}
-		}
-		list := &unstructured.UnstructuredList{}
-		list.SetGroupVersionKind(appsv1.SchemeGroupVersion.WithKind("DeploymentList"))
-		return list
-	}
-
-	setStatusReplicas := func(g *WithT, obj client.Object, replicas int32) {
-		switch obj := obj.(type) {
-		case *unstructured.Unstructured:
-			g.Expect(unstructured.SetNestedField(obj.Object, int64(replicas), "status", "replicas")).To(Succeed())
-		case *appsv1.Deployment:
-			obj.Status.Replicas = replicas
-		default:
-			panic(fmt.Sprintf("unhandled representation %T", obj))
-		}
-	}
-
-	applyConfiguration := func(ac *appsv1applyconfigurations.DeploymentApplyConfiguration) (runtime.ApplyConfiguration, func() string) {
-		if !isUnstructured {
-			return ac, func() string { return ptr.Deref(ac.ResourceVersion, "") }
-		}
-		u := mustToUnstructured(ac)
-		return client.ApplyConfigurationFromUnstructured(u), u.GetResourceVersion
 	}
 
 	resourceVersion := func(g *WithT, rv string) int64 {
@@ -547,10 +300,10 @@ func testConsistentFakeClientForRepresentation(t *testing.T, namespace string, d
 		return resourceVersion(g, d.GetResourceVersion())
 	}
 	apply := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		ac, rv := applyConfiguration(appsv1applyconfigurations.Deployment(deployment().GetName(), namespace).
-			WithLabels(map[string]string{"applied": "true"}))
+		ac := appsv1applyconfigurations.Deployment(deployment().GetName(), namespace).
+			WithLabels(map[string]string{"applied": "true"})
 		g.Expect(c.Apply(ctx, ac, client.FieldOwner("test"))).To(Succeed())
-		return resourceVersion(g, rv())
+		return resourceVersion(g, ptr.Deref(ac.ResourceVersion, ""))
 	}
 	deleteObject := func(ctx context.Context, c client.Client, g *WithT) int64 {
 		g.Expect(c.Delete(ctx, deployment())).To(Succeed())
@@ -559,22 +312,22 @@ func testConsistentFakeClientForRepresentation(t *testing.T, namespace string, d
 	updateStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
 		d := deployment()
 		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d)).To(Succeed())
-		setStatusReplicas(g, d, 5)
+		d.Status.Replicas = 5
 		g.Expect(c.Status().Update(ctx, d)).To(Succeed())
 		return resourceVersion(g, d.GetResourceVersion())
 	}
 	patchStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
 		d := deployment()
 		patch := client.MergeFrom(d.DeepCopyObject().(client.Object))
-		setStatusReplicas(g, d, 6)
+		d.Status.Replicas = 6
 		g.Expect(c.Status().Patch(ctx, d, patch)).To(Succeed())
 		return resourceVersion(g, d.GetResourceVersion())
 	}
 	applyStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		ac, rv := applyConfiguration(appsv1applyconfigurations.Deployment("test", namespace).
-			WithStatus(appsv1applyconfigurations.DeploymentStatus().WithReplicas(7)))
+		ac := appsv1applyconfigurations.Deployment("test", namespace).
+			WithStatus(appsv1applyconfigurations.DeploymentStatus().WithReplicas(7))
 		g.Expect(c.Status().Apply(ctx, ac, client.FieldOwner("test"))).To(Succeed())
-		return resourceVersion(g, rv())
+		return resourceVersion(g, ptr.Deref(ac.ResourceVersion, ""))
 	}
 	updateScale := func(ctx context.Context, c client.Client, g *WithT) int64 {
 		d := deployment()
@@ -589,15 +342,10 @@ func testConsistentFakeClientForRepresentation(t *testing.T, namespace string, d
 		g.Expect(resourceVersion(g, result.GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
 	}
 	list := func(ctx context.Context, c client.Client, g *WithT, writtenRV <-chan int64) {
-		result := deploymentList()
+		result := &appsv1.DeploymentList{}
 		g.Expect(c.List(ctx, result)).To(Succeed())
-		items, err := meta.ExtractList(result)
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(items).To(HaveLen(1))
-
-		item, err := meta.Accessor(items[0])
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(resourceVersion(g, item.GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
+		g.Expect(result.Items).To(HaveLen(1))
+		g.Expect(resourceVersion(g, result.Items[0].GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
 	}
 	getTerminating := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
 		result := deployment()
@@ -606,24 +354,18 @@ func testConsistentFakeClientForRepresentation(t *testing.T, namespace string, d
 		g.Expect(result.GetFinalizers()).To(ConsistOf("test.io/finalizer"))
 	}
 	listTerminating := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
-		result := deploymentList()
+		result := &appsv1.DeploymentList{}
 		g.Expect(c.List(ctx, result)).To(Succeed())
-		items, err := meta.ExtractList(result)
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(items).To(HaveLen(1))
-
-		item, err := meta.Accessor(items[0])
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(item.GetDeletionTimestamp()).ToNot(BeNil(), "expected the deletionTimestamp to be set")
-		g.Expect(item.GetFinalizers()).To(ConsistOf("test.io/finalizer"))
+		g.Expect(result.Items).To(HaveLen(1))
+		g.Expect(result.Items[0].GetDeletionTimestamp()).ToNot(BeNil(), "expected the deletionTimestamp to be set")
+		g.Expect(result.Items[0].GetFinalizers()).To(ConsistOf("test.io/finalizer"))
 	}
 
 	testCases := []struct {
-		name                    string
-		supportsPartialMetadata bool
-		initObjects             func() []client.Object
-		write                   func(ctx context.Context, client client.Client, g *WithT) int64
-		read                    func(ctx context.Context, client client.Client, g *WithT, writtenRV <-chan int64)
+		name            string
+		maybeInitObject func() *appsv1.Deployment
+		write           func(ctx context.Context, client client.Client, g *WithT) int64
+		read            func(ctx context.Context, client client.Client, g *WithT, writtenRV <-chan int64)
 	}{
 		{
 			name:  "Get after Create",
@@ -636,30 +378,28 @@ func testConsistentFakeClientForRepresentation(t *testing.T, namespace string, d
 			read:  list,
 		},
 		{
-			name:        "Get after Update",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       update,
-			read:        get,
+			name:            "Get after Update",
+			maybeInitObject: deployment,
+			write:           update,
+			read:            get,
 		},
 		{
-			name:        "List after Update",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       update,
-			read:        list,
+			name:            "List after Update",
+			maybeInitObject: deployment,
+			write:           update,
+			read:            list,
 		},
 		{
-			name:                    "Get after Patch",
-			supportsPartialMetadata: true,
-			initObjects:             func() []client.Object { return []client.Object{deployment()} },
-			write:                   patch,
-			read:                    get,
+			name:            "Get after Patch",
+			maybeInitObject: deployment,
+			write:           patch,
+			read:            get,
 		},
 		{
-			name:                    "List after Patch",
-			supportsPartialMetadata: true,
-			initObjects:             func() []client.Object { return []client.Object{deployment()} },
-			write:                   patch,
-			read:                    list,
+			name:            "List after Patch",
+			maybeInitObject: deployment,
+			write:           patch,
+			read:            list,
 		},
 		{
 			name:  "Get after Apply",
@@ -672,10 +412,9 @@ func testConsistentFakeClientForRepresentation(t *testing.T, namespace string, d
 			read:  list,
 		},
 		{
-			name:                    "Get after Delete",
-			supportsPartialMetadata: true,
-			initObjects:             func() []client.Object { return []client.Object{deployment()} },
-			write:                   deleteObject,
+			name:            "Get after Delete",
+			maybeInitObject: deployment,
+			write:           deleteObject,
 			read: func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
 				d := deployment()
 				err := c.Get(ctx, client.ObjectKeyFromObject(d), d)
@@ -683,147 +422,106 @@ func testConsistentFakeClientForRepresentation(t *testing.T, namespace string, d
 			},
 		},
 		{
-			name:                    "List after Delete",
-			supportsPartialMetadata: true,
-			initObjects:             func() []client.Object { return []client.Object{deployment()} },
-			write:                   deleteObject,
+			name:            "List after Delete",
+			maybeInitObject: deployment,
+			write:           deleteObject,
 			read: func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
-				result := deploymentList()
+				result := &appsv1.DeploymentList{}
 				g.Expect(c.List(ctx, result)).To(Succeed())
-				items, err := meta.ExtractList(result)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(items).To(BeEmpty())
+				g.Expect(result.Items).To(BeEmpty())
 			},
 		},
 		{
-			name:                    "Get after Delete of an object with finalizers",
-			supportsPartialMetadata: true,
-			initObjects:             func() []client.Object { return []client.Object{deploymentWithFinalizer()} },
-			write:                   deleteObject,
-			read:                    getTerminating,
+			name:            "Get after Delete of an object with finalizers",
+			maybeInitObject: deploymentWithFinalizer,
+			write:           deleteObject,
+			read:            getTerminating,
 		},
 		{
-			name:                    "List after Delete of an object with finalizers",
-			supportsPartialMetadata: true,
-			initObjects:             func() []client.Object { return []client.Object{deploymentWithFinalizer()} },
-			write:                   deleteObject,
-			read:                    listTerminating,
+			name:            "List after Delete of an object with finalizers",
+			maybeInitObject: deploymentWithFinalizer,
+			write:           deleteObject,
+			read:            listTerminating,
 		},
 		{
-			name:        "Get after status Update",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       updateStatus,
-			read:        get,
+			name:            "Get after status Update",
+			maybeInitObject: deployment,
+			write:           updateStatus,
+			read:            get,
 		},
 		{
-			name:        "List after status Update",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       updateStatus,
-			read:        list,
+			name:            "List after status Update",
+			maybeInitObject: deployment,
+			write:           updateStatus,
+			read:            list,
 		},
 		{
-			name:        "Get after status Patch",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       patchStatus,
-			read:        get,
+			name:            "Get after status Patch",
+			maybeInitObject: deployment,
+			write:           patchStatus,
+			read:            get,
 		},
 		{
-			name:        "List after status Patch",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       patchStatus,
-			read:        list,
+			name:            "List after status Patch",
+			maybeInitObject: deployment,
+			write:           patchStatus,
+			read:            list,
 		},
 		{
-			name:        "Get after status Apply",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       applyStatus,
-			read:        get,
+			name:            "Get after status Apply",
+			maybeInitObject: deployment,
+			write:           applyStatus,
+			read:            get,
 		},
 		{
-			name:        "List after status Apply",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       applyStatus,
-			read:        list,
+			name:            "List after status Apply",
+			maybeInitObject: deployment,
+			write:           applyStatus,
+			read:            list,
 		},
 		{
-			name:        "Get after scale Update",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       updateScale,
-			read:        get,
+			name:            "Get after scale Update",
+			maybeInitObject: deployment,
+			write:           updateScale,
+			read:            get,
 		},
 		{
-			name:        "List after scale Update",
-			initObjects: func() []client.Object { return []client.Object{deployment()} },
-			write:       updateScale,
-			read:        list,
-		},
-	}
-	cacheConfigs := []struct {
-		name string
-		opts cache.Options
-	}{
-		{
-			name: "default",
-		},
-		{
-			name: "multi-namespace cache",
-			opts: cache.Options{DefaultNamespaces: map[string]cache.Config{
-				namespace: {},
-				"ns-2":    {},
-			}},
+			name:            "List after scale Update",
+			maybeInitObject: deployment,
+			write:           updateScale,
+			read:            list,
 		},
 	}
 
-	for _, cacheConfig := range cacheConfigs {
-		for _, tc := range testCases {
-			t.Run(cacheConfig.name+": "+tc.name, func(t *testing.T) {
-				t.Parallel()
-				if isPartialMetadata && !tc.supportsPartialMetadata {
-					t.Skip("not supported by partial metadata object")
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				g := NewWithT(t)
+				locker := keyLockerWithLockCallback{}
+
+				var initObjects []client.Object
+				if tc.maybeInitObject != nil {
+					initObjects = []client.Object{tc.maybeInitObject()}
 				}
-				synctest.Test(t, func(t *testing.T) {
-					g := NewWithT(t)
-					locker := keyLockerWithLockCallback{}
-					opts := cacheConfig.opts
-					opts.Mapper = mapper
+				c := newConsistentFakeClient(t, &locker, initObjects...)
+				synctest.Wait() // wait for cache start to finish
 
-					var initObjects []client.Object
-					if tc.initObjects != nil {
-						initObjects = tc.initObjects()
-					}
-					c := newConsistentFakeClient(t, &locker, opts, deployment(), initObjects...)
-					synctest.Wait() // wait for cache start to finish
-
+				writtenRV := make(chan int64, 1)
+				callBackFinished := make(chan struct{})
+				locker.lockCallback = sync.OnceFunc(func() {
 					// Must happen in a goroutine otherwise we deadlock, as we are waiting for the write to release the lock while
 					// blocking it from finishing the acquisition.
-					writtenRV := make(chan int64, 1)
-					callBackFinished := make(chan struct{})
-					locker.lockCallback = sync.OnceFunc(func() {
-						go func() {
-							defer close(callBackFinished)
+					go func() {
+						defer close(callBackFinished)
 
-							tc.read(t.Context(), c, g, writtenRV)
-						}()
-					})
-					writtenRV <- tc.write(t.Context(), c, g)
-
-					<-callBackFinished
+						tc.read(t.Context(), c, g, writtenRV)
+					}()
 				})
+				writtenRV <- tc.write(t.Context(), c, g)
+
+				<-callBackFinished
 			})
-		}
+		})
 	}
-}
-
-func mustToUnstructured(obj any) *unstructured.Unstructured {
-	serialized, err := json.Marshal(obj)
-	if err != nil {
-		panic(fmt.Sprintf("failed to serialize %T: %v", obj, err))
-	}
-
-	content := map[string]any{}
-	if err := json.Unmarshal(serialized, &content); err != nil {
-		panic(fmt.Sprintf("failed to deserialize %T into an unstructured: %v", obj, err))
-	}
-
-	return &unstructured.Unstructured{Object: content}
 }

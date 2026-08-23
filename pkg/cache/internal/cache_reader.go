@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/cache"
 
-	"sigs.k8s.io/controller-runtime/pkg/cache/internal/readerconsistency"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/internal/field/selector"
 )
@@ -50,8 +49,6 @@ type CacheReader struct {
 	// Be very careful with this, when enabled you must DeepCopy any object before mutating it,
 	// otherwise you will mutate the object in the cache.
 	disableDeepCopy bool
-
-	*readerconsistency.ConsistencyHandler
 }
 
 // Get checks the indexer for the object and writes a copy of it if found.
@@ -63,10 +60,6 @@ func (c *CacheReader) Get(ctx context.Context, key client.ObjectKey, out client.
 		key.Namespace = ""
 	}
 	storeKey := objectKeyToStoreKey(key)
-
-	if err := c.ConsistencyHandler.WaitForGet(ctx, key); err != nil {
-		return err
-	}
 
 	// Lookup the object from the indexer cache
 	obj, exists, err := c.indexer.GetByKey(storeKey)
@@ -122,10 +115,6 @@ func (c *CacheReader) List(ctx context.Context, out client.ObjectList, opts ...c
 
 	if listOpts.Continue != "" {
 		return fmt.Errorf("continue list option is not supported by the cache")
-	}
-
-	if err := c.ConsistencyHandler.WaitForList(ctx); err != nil {
-		return err
 	}
 
 	switch {

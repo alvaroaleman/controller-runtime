@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package readerconsistency
+package consistencyhandler
 
 import (
 	"context"
@@ -27,11 +27,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func configMap(key client.ObjectKey, uid types.UID, rv string) *corev1.ConfigMap {
+func configMap(key types.NamespacedName, uid types.UID, rv string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
 		Namespace:       key.Namespace,
 		Name:            key.Name,
@@ -48,7 +46,7 @@ func TestWaitForGetWaitsForMinRV(t *testing.T) {
 		defer cancel()
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
 
 		h.SetMinimumRV(key, 10)
 		result := make(chan error, 1)
@@ -74,7 +72,7 @@ func TestWaitForGetReturnsContextErrorIfMinRVIsNeverObserved(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
 
 		h.SetMinimumRV(key, 10)
 		result := make(chan error, 1)
@@ -97,8 +95,8 @@ func TestWaitForGetWaitsForPendingDeletesOfItsKeyOnly(t *testing.T) {
 		defer cancel()
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
-		otherKey := client.ObjectKey{Namespace: "default", Name: "bar"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
+		otherKey := types.NamespacedName{Namespace: "default", Name: "bar"}
 
 		h.AddPendingDelete(key, "uid-1")
 		h.AddPendingDelete(key, "uid-2")
@@ -128,7 +126,7 @@ func TestWaitForGetDoesNotWaitForPendingDeletesAddedAfterItWasCalled(t *testing.
 		defer cancel()
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
 
 		h.AddPendingDelete(key, "uid-1")
 
@@ -153,7 +151,7 @@ func TestWaitForListWaitsForMinRV(t *testing.T) {
 		defer cancel()
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
 
 		h.SetMinimumRV(key, 10)
 		result := make(chan error, 1)
@@ -179,7 +177,7 @@ func TestWaitForListReturnsContextErrorIfMinRVIsNeverObserved(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
 
 		h.SetMinimumRV(key, 10)
 		result := make(chan error, 1)
@@ -202,8 +200,8 @@ func TestWaitForListWaitsForPendingDeletesOfAllKeys(t *testing.T) {
 		defer cancel()
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
-		otherKey := client.ObjectKey{Namespace: "other", Name: "bar"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
+		otherKey := types.NamespacedName{Namespace: "other", Name: "bar"}
 
 		h.AddPendingDelete(key, "uid-1")
 		h.AddPendingDelete(otherKey, "uid-2")
@@ -232,8 +230,8 @@ func TestWaitForListDoesNotWaitForPendingDeletesAddedAfterItWasCalled(t *testing
 		defer cancel()
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
-		otherKey := client.ObjectKey{Namespace: "other", Name: "bar"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
+		otherKey := types.NamespacedName{Namespace: "other", Name: "bar"}
 
 		h.AddPendingDelete(key, "uid-1")
 
@@ -258,7 +256,7 @@ func TestWaitForListIsUnblockedByRemovePendingDelete(t *testing.T) {
 		defer cancel()
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
 
 		h.AddPendingDelete(key, "uid-1")
 
@@ -282,7 +280,7 @@ func TestWaitForGetIsUnblockedByRemovePendingDelete(t *testing.T) {
 		defer cancel()
 
 		h := NewHandler(logr.Discard())
-		key := client.ObjectKey{Namespace: "default", Name: "foo"}
+		key := types.NamespacedName{Namespace: "default", Name: "foo"}
 
 		h.AddPendingDelete(key, "uid-1")
 

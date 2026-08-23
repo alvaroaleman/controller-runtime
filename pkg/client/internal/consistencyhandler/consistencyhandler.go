@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package readerconsistency
+package consistencyhandler
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"strconv"
 	"sync"
@@ -27,7 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
 )
 
 func NewHandler(log logr.Logger) *ConsistencyHandler {
@@ -35,9 +36,9 @@ func NewHandler(log logr.Logger) *ConsistencyHandler {
 		rvBroadCaster:             &broadcaster{},
 		pendingDeletesBroadcaster: &broadcaster{},
 		pendingDeletesLock:        sync.RWMutex{},
-		pendingDeletes:            make(map[client.ObjectKey]sets.Set[types.UID]),
+		pendingDeletes:            make(map[types.NamespacedName]sets.Set[types.UID]),
 		minimumRVsLock:            sync.Mutex{},
-		minimumRVs:                make(map[client.ObjectKey]int64),
+		minimumRVs:                make(map[types.NamespacedName]int64),
 		log:                       log,
 	}
 }
@@ -48,23 +49,64 @@ type ConsistencyHandler struct {
 
 	pendingDeletesBroadcaster *broadcaster
 	pendingDeletesLock        sync.RWMutex
-	// pendingDeletes holds pending deletes. Must only be acquired when holding pendingDeletesLock
-	pendingDeletes map[client.ObjectKey]sets.Set[types.UID]
+	// pendingDeletes holds pending deletes. Must only be accessed when holding pendingDeletesLock
+	pendingDeletes map[types.NamespacedName]sets.Set[types.UID]
 
 	minimumRVsLock sync.Mutex
 	// minimumRVs stores the minimum RVs we must have seen before returning reads.
-	minimumRVs map[client.ObjectKey]int64
+	minimumRVs map[types.NamespacedName]int64
+
+	registerLock sync.Mutex
+	registered   bool
+	registration *cache.ResourceEventHandlerRegistration
 
 	log logr.Logger
 }
 
-func (h *ConsistencyHandler) SetMinimumRV(key client.ObjectKey, rv int64) {
+func (h *ConsistencyHandler) Registered() bool {
+	h.registerLock.Lock()
+	defer h.registerLock.Unlock()
+	return h.registered
+}
+
+func (h *ConsistencyHandler) Register(ctx context.Context, informer cacheapi.Informer) error {
+	h.registerLock.Lock()
+	defer h.registerLock.Unlock()
+
+	// Check again in case it got registered while we waited for the lock
+	if h.registered {
+		return nil
+	}
+
+	if h.registration != nil {
+		return h.waitForHandlerSyncLocked(ctx, *h.registration)
+	}
+
+	registration, err := informer.AddEventHandler(h)
+	if err != nil {
+		return fmt.Errorf("failed to add consistency handler to informer: %w", err)
+	}
+
+	return h.waitForHandlerSyncLocked(ctx, registration)
+}
+
+func (h *ConsistencyHandler) waitForHandlerSyncLocked(ctx context.Context, registration cache.ResourceEventHandlerRegistration) error {
+	select {
+	case <-registration.HasSyncedChecker().Done():
+		h.registered = true
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("failed waiting for consistency handler to sync: %w", ctx.Err())
+	}
+}
+
+func (h *ConsistencyHandler) SetMinimumRV(key types.NamespacedName, rv int64) {
 	h.minimumRVsLock.Lock()
 	defer h.minimumRVsLock.Unlock()
 	h.minimumRVs[key] = rv
 }
 
-func (h *ConsistencyHandler) getMinimumRVForKey(key client.ObjectKey) int64 {
+func (h *ConsistencyHandler) getMinimumRVForKey(key types.NamespacedName) int64 {
 	h.minimumRVsLock.Lock()
 	defer h.minimumRVsLock.Unlock()
 	return h.minimumRVs[key]
@@ -92,7 +134,7 @@ func (h *ConsistencyHandler) cleanupMinimumRVs(currentRV int64) {
 	}
 }
 
-func (h *ConsistencyHandler) AddPendingDelete(key client.ObjectKey, uid types.UID) {
+func (h *ConsistencyHandler) AddPendingDelete(key types.NamespacedName, uid types.UID) {
 	h.pendingDeletesLock.Lock()
 	defer h.pendingDeletesLock.Unlock()
 
@@ -103,7 +145,7 @@ func (h *ConsistencyHandler) AddPendingDelete(key client.ObjectKey, uid types.UI
 	h.pendingDeletes[key].Insert(uid)
 }
 
-func (h *ConsistencyHandler) RemovePendingDelete(key client.ObjectKey, uid types.UID) {
+func (h *ConsistencyHandler) RemovePendingDelete(key types.NamespacedName, uid types.UID) {
 	h.pendingDeletesLock.Lock()
 	defer h.pendingDeletesLock.Unlock()
 
@@ -124,7 +166,7 @@ func (h *ConsistencyHandler) WaitForList(ctx context.Context) error {
 	return h.waitAllDeletes(ctx)
 }
 
-func (h *ConsistencyHandler) WaitForGet(ctx context.Context, key client.ObjectKey) error {
+func (h *ConsistencyHandler) WaitForGet(ctx context.Context, key types.NamespacedName) error {
 	if err := h.waitForRV(ctx, h.getMinimumRVForKey(key)); err != nil {
 		return err
 	}
@@ -133,7 +175,7 @@ func (h *ConsistencyHandler) WaitForGet(ctx context.Context, key client.ObjectKe
 }
 
 // waitDeletesForKey blocks until all pending deletes at the time of calling it were observed or context times out
-func (h *ConsistencyHandler) waitDeletesForKey(ctx context.Context, key client.ObjectKey) error {
+func (h *ConsistencyHandler) waitDeletesForKey(ctx context.Context, key types.NamespacedName) error {
 	h.pendingDeletesLock.RLock()
 	pendingDeletes := maps.Clone(h.pendingDeletes[key])
 	h.pendingDeletesLock.RUnlock()
@@ -190,8 +232,8 @@ func (h *ConsistencyHandler) allDeletedLocked(uids sets.Set[types.UID]) bool {
 	return true
 }
 
-func (h *ConsistencyHandler) observeDeletion(obj client.Object) {
-	key := client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}
+func (h *ConsistencyHandler) observeDeletion(obj cacheapi.Object) {
+	key := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
 	h.pendingDeletesLock.Lock()
 	defer h.pendingDeletesLock.Unlock()
 
@@ -245,32 +287,32 @@ func (h *ConsistencyHandler) observeResourceVersion(rv string) {
 }
 
 func (h *ConsistencyHandler) OnAdd(raw any, _ bool) {
-	obj, ok := raw.(client.Object)
+	obj, ok := raw.(cacheapi.Object)
 	if !ok {
-		h.log.Error(nil, "OnAdd received object that is not a client.Object", "object", raw)
+		h.log.Error(nil, "OnAdd received object that is not a cacheapi.Object", "object", raw)
 		return
 	}
 	go func() { h.observeResourceVersion(obj.GetResourceVersion()) }()
 }
 
 func (h *ConsistencyHandler) OnUpdate(_, newObj any) {
-	obj, ok := newObj.(client.Object)
+	obj, ok := newObj.(cacheapi.Object)
 	if !ok {
-		h.log.Error(nil, "OnUpdate received object that is not a client.Object", "object", newObj)
+		h.log.Error(nil, "OnUpdate received object that is not a cacheapi.Object", "object", newObj)
 		return
 	}
 	go func() { h.observeResourceVersion(obj.GetResourceVersion()) }()
 }
 
 func (h *ConsistencyHandler) OnDelete(raw any) {
-	var obj client.Object
+	var obj cacheapi.Object
 	switch t := raw.(type) {
-	case client.Object:
+	case cacheapi.Object:
 		obj = t
 	case cache.DeletedFinalStateUnknown:
-		obj = t.Obj.(client.Object)
+		obj = t.Obj.(cacheapi.Object)
 	default:
-		h.log.Error(nil, "OnDelete received object that is not a client.Object or DeletedFinalStateUnknown", "object", raw)
+		h.log.Error(nil, "OnDelete received object that is not a cacheapi.Object or DeletedFinalStateUnknown", "object", raw)
 		return
 	}
 	go func() { h.observeResourceVersion(obj.GetResourceVersion()) }()

@@ -18,7 +18,6 @@ package cache
 
 import (
 	"context"
-	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -34,8 +33,8 @@ import (
 // and uses the defaultCache otherwise.
 type delegatingByGVKCache struct {
 	scheme       *runtime.Scheme
-	caches       map[schema.GroupVersionKind]internalCache
-	defaultCache internalCache
+	caches       map[schema.GroupVersionKind]Cache
+	defaultCache Cache
 }
 
 func (dbt *delegatingByGVKCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -68,30 +67,6 @@ func (dbt *delegatingByGVKCache) GetInformer(ctx context.Context, obj client.Obj
 		return nil, err
 	}
 	return cache.GetInformer(ctx, obj, opts...)
-}
-
-func (dbt *delegatingByGVKCache) SetMinimumRVForObject(obj client.Object, rv int64) error {
-	gvk, err := apiutil.GVKForObject(obj, dbt.scheme)
-	if err != nil {
-		return fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
-	}
-	return dbt.cacheForGVK(gvk).SetMinimumRVForObject(obj, rv)
-}
-
-func (dbt *delegatingByGVKCache) AddRequiredDeleteForObject(obj client.Object) error {
-	cache, err := dbt.cacheForObject(obj)
-	if err != nil {
-		return err
-	}
-	return cache.AddRequiredDeleteForObject(obj)
-}
-
-func (dbt *delegatingByGVKCache) RemoveRequiredDeleteForObject(obj client.Object) error {
-	cache, err := dbt.cacheForObject(obj)
-	if err != nil {
-		return fmt.Errorf("getting cache for object: %w", err)
-	}
-	return cache.RemoveRequiredDeleteForObject(obj)
 }
 
 func (dbt *delegatingByGVKCache) GetInformerForKind(ctx context.Context, gvk schema.GroupVersionKind, opts ...InformerGetOption) (Informer, error) {
@@ -141,7 +116,7 @@ func (dbt *delegatingByGVKCache) IndexField(ctx context.Context, obj client.Obje
 	return cache.IndexField(ctx, obj, field, extractValue)
 }
 
-func (dbt *delegatingByGVKCache) cacheForObject(o runtime.Object) (internalCache, error) {
+func (dbt *delegatingByGVKCache) cacheForObject(o runtime.Object) (Cache, error) {
 	gvk, err := apiutil.GVKForObject(o, dbt.scheme)
 	if err != nil {
 		return nil, err
@@ -150,7 +125,7 @@ func (dbt *delegatingByGVKCache) cacheForObject(o runtime.Object) (internalCache
 	return dbt.cacheForGVK(gvk), nil
 }
 
-func (dbt *delegatingByGVKCache) cacheForGVK(gvk schema.GroupVersionKind) internalCache {
+func (dbt *delegatingByGVKCache) cacheForGVK(gvk schema.GroupVersionKind) Cache {
 	if specific, hasSpecific := dbt.caches[gvk]; hasSpecific {
 		return specific
 	}

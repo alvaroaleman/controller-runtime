@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -32,7 +33,9 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 
+	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -72,6 +75,9 @@ type Options struct {
 	//  - FieldValidationStrict
 	// For more details, see: https://kubernetes.io/docs/reference/using-api/api-concepts/#field-validation
 	FieldValidation string
+
+	// Log will be used by the client if it encounters any errors.
+	Log logr.Logger
 }
 
 // CacheOptions are options for creating a cache-backed client.
@@ -93,7 +99,9 @@ type CacheOptions struct {
 	//
 	// This is an experimental feature, a form of this will be kept but both the details of
 	// how exactly it works and how exactly it is configured may change.
-	ReadYourOwnWriteConsistencyEnabled bool
+	//
+	// Defaults to false.
+	ReadYourOwnWriteConsistencyEnabled *bool
 }
 
 // NewClientFunc allows a user to define how to create a client.
@@ -179,6 +187,10 @@ func newClient(config *rest.Config, options Options) (Client, error) {
 		}
 	}
 
+	if options.Log.IsZero() {
+		options.Log = log.Log.WithName("client")
+	}
+
 	resources := &clientRestResources{
 		httpClient: options.HTTPClient,
 		config:     config,
@@ -229,15 +241,21 @@ func newClient(config *rest.Config, options Options) (Client, error) {
 		c.uncachedGVKs[gvk] = struct{}{}
 	}
 
-	if !options.Cache.ReadYourOwnWriteConsistencyEnabled {
+	if !ptr.Deref(options.Cache.ReadYourOwnWriteConsistencyEnabled, false) {
 		return c, nil
 	}
 
-	informerCache, isCache := options.Cache.Reader.(cache)
+	informerCache, isCache := options.Cache.Reader.(cacheapi.Informers)
 	if !isCache {
-		return nil, fmt.Errorf("cache reader does not implement %T, can not provide ReadYourOwnWriteConsistency", cache(nil))
+		return nil, fmt.Errorf("cache reader does not implement %T, can not provide ReadYourOwnWriteConsistency", cacheapi.Informers(nil))
 	}
-	return newConsistentClient(c, informerCache, nil), nil
+
+	return newConsistentClient(
+		c,
+		informerCache,
+		func() keyLock { return &keyLocker{} },
+		options.Log,
+	), nil
 }
 
 var _ Client = &client{}

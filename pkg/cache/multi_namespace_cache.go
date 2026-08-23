@@ -42,15 +42,15 @@ func newMultiNamespaceCache(
 	restMapper apimeta.RESTMapper,
 	namespaces map[string]Config,
 	globalConfig *Config, // may be nil in which case no cache for cluster-scoped objects will be created
-) internalCache {
+) Cache {
 	// Create every namespace cache.
-	caches := map[string]internalCache{}
+	caches := map[string]Cache{}
 	for namespace, config := range namespaces {
 		caches[namespace] = newCache(config, namespace)
 	}
 
 	// Create a cache for cluster scoped resources if requested
-	var clusterCache internalCache
+	var clusterCache Cache
 	if globalConfig != nil {
 		clusterCache = newCache(*globalConfig, corev1.NamespaceAll)
 	}
@@ -70,11 +70,11 @@ func newMultiNamespaceCache(
 type multiNamespaceCache struct {
 	Scheme           *runtime.Scheme
 	RESTMapper       apimeta.RESTMapper
-	namespaceToCache map[string]internalCache
-	clusterCache     internalCache
+	namespaceToCache map[string]Cache
+	clusterCache     Cache
 }
 
-var _ internalCache = &multiNamespaceCache{}
+var _ Cache = &multiNamespaceCache{}
 
 // Methods for multiNamespaceCache to conform to the Informers interface.
 
@@ -217,46 +217,6 @@ func (c *multiNamespaceCache) IndexField(ctx context.Context, obj client.Object,
 			return err
 		}
 	}
-	return nil
-}
-
-func (c *multiNamespaceCache) SetMinimumRVForObject(obj client.Object, rv int64) error {
-	if obj.GetNamespace() == "" {
-		if c.clusterCache != nil {
-			return c.clusterCache.SetMinimumRVForObject(obj, rv)
-		}
-		return nil
-	}
-	if cache, ok := c.namespaceToCache[obj.GetNamespace()]; ok {
-		return cache.SetMinimumRVForObject(obj, rv)
-	}
-	if global, ok := c.namespaceToCache[metav1.NamespaceAll]; ok {
-		return global.SetMinimumRVForObject(obj, rv)
-	}
-	return nil
-}
-
-func (c *multiNamespaceCache) AddRequiredDeleteForObject(obj client.Object) error {
-	if ns := obj.GetNamespace(); ns == "" && c.clusterCache != nil {
-		return c.clusterCache.AddRequiredDeleteForObject(obj)
-	} else if cache, ok := c.namespaceToCache[ns]; ok {
-		return cache.AddRequiredDeleteForObject(obj)
-	} else if global, ok := c.namespaceToCache[metav1.NamespaceAll]; ok {
-		return global.AddRequiredDeleteForObject(obj)
-	}
-
-	return nil
-}
-
-func (c *multiNamespaceCache) RemoveRequiredDeleteForObject(obj client.Object) error {
-	if ns := obj.GetNamespace(); ns == "" && c.clusterCache != nil {
-		return c.clusterCache.RemoveRequiredDeleteForObject(obj)
-	} else if cache, ok := c.namespaceToCache[ns]; ok {
-		return cache.RemoveRequiredDeleteForObject(obj)
-	} else if global, ok := c.namespaceToCache[metav1.NamespaceAll]; ok {
-		return global.RemoveRequiredDeleteForObject(obj)
-	}
-
 	return nil
 }
 

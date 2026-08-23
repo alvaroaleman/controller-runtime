@@ -51,6 +51,7 @@ var _ = Describe("ConsistentClient", func() {
 
 		// Set up informers for types used through the consistent client.
 		_, err = c.GetInformer(ctx, &corev1.ConfigMap{})
+		Expect(err).NotTo(HaveOccurred())
 		_, err = c.GetInformer(ctx, &corev1.Namespace{})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -64,7 +65,7 @@ var _ = Describe("ConsistentClient", func() {
 			Scheme: kscheme.Scheme,
 			Cache: &client.CacheOptions{
 				Reader:                             c,
-				ReadYourOwnWriteConsistencyEnabled: true,
+				ReadYourOwnWriteConsistencyEnabled: new(true),
 			},
 		})
 		Expect(err).NotTo(HaveOccurred())
