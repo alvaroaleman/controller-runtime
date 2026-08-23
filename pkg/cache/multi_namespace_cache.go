@@ -220,20 +220,20 @@ func (c *multiNamespaceCache) IndexField(ctx context.Context, obj client.Object,
 	return nil
 }
 
-func (c *multiNamespaceCache) SetMinimumRVForGVKAndKey(gvk schema.GroupVersionKind, key client.ObjectKey, rv int64) {
-	if key.Namespace == "" {
+func (c *multiNamespaceCache) SetMinimumRVForObject(obj client.Object, rv int64) error {
+	if obj.GetNamespace() == "" {
 		if c.clusterCache != nil {
-			c.clusterCache.SetMinimumRVForGVKAndKey(gvk, key, rv)
+			return c.clusterCache.SetMinimumRVForObject(obj, rv)
 		}
-		return
+		return nil
 	}
-	if cache, ok := c.namespaceToCache[key.Namespace]; ok {
-		cache.SetMinimumRVForGVKAndKey(gvk, key, rv)
-		return
+	if cache, ok := c.namespaceToCache[obj.GetNamespace()]; ok {
+		return cache.SetMinimumRVForObject(obj, rv)
 	}
 	if global, ok := c.namespaceToCache[metav1.NamespaceAll]; ok {
-		global.SetMinimumRVForGVKAndKey(gvk, key, rv)
+		return global.SetMinimumRVForObject(obj, rv)
 	}
+	return nil
 }
 
 func (c *multiNamespaceCache) AddRequiredDeleteForObject(obj client.Object) error {

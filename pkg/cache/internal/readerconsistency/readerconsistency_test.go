@@ -47,11 +47,12 @@ func TestWaitForGetWaitsForMinRV(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
 		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 
+		h.SetMinimumRV(key, 10)
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForGet(ctx, key, 10) }()
+		go func() { result <- h.WaitForGet(ctx, key) }()
 
 		synctest.Wait()
 		g.Expect(result).NotTo(Receive())
@@ -72,11 +73,12 @@ func TestWaitForGetReturnsContextErrorIfMinRVIsNeverObserved(t *testing.T) {
 		g := NewWithT(t)
 		ctx, cancel := context.WithCancel(t.Context())
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
 		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 
+		h.SetMinimumRV(key, 10)
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForGet(ctx, key, 10) }()
+		go func() { result <- h.WaitForGet(ctx, key) }()
 
 		synctest.Wait()
 		g.Expect(result).NotTo(Receive())
@@ -94,7 +96,7 @@ func TestWaitForGetWaitsForPendingDeletesOfItsKeyOnly(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
 		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 		otherKey := client.ObjectKey{Namespace: "default", Name: "bar"}
 
@@ -103,7 +105,7 @@ func TestWaitForGetWaitsForPendingDeletesOfItsKeyOnly(t *testing.T) {
 		h.AddPendingDelete(otherKey, "uid-3")
 
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForGet(ctx, key, 0) }()
+		go func() { result <- h.WaitForGet(ctx, key) }()
 		synctest.Wait()
 
 		g.Expect(result).NotTo(Receive())
@@ -125,13 +127,13 @@ func TestWaitForGetDoesNotWaitForPendingDeletesAddedAfterItWasCalled(t *testing.
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
 		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 
 		h.AddPendingDelete(key, "uid-1")
 
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForGet(ctx, key, 0) }()
+		go func() { result <- h.WaitForGet(ctx, key) }()
 		synctest.Wait()
 
 		g.Expect(result).NotTo(Receive())
@@ -150,11 +152,12 @@ func TestWaitForListWaitsForMinRV(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
 		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 
+		h.SetMinimumRV(key, 10)
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForList(ctx, 10) }()
+		go func() { result <- h.WaitForList(ctx) }()
 		synctest.Wait()
 
 		g.Expect(result).NotTo(Receive())
@@ -175,10 +178,12 @@ func TestWaitForListReturnsContextErrorIfMinRVIsNeverObserved(t *testing.T) {
 		g := NewWithT(t)
 		ctx, cancel := context.WithCancel(t.Context())
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
+		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 
+		h.SetMinimumRV(key, 10)
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForList(ctx, 10) }()
+		go func() { result <- h.WaitForList(ctx) }()
 		synctest.Wait()
 
 		g.Expect(result).NotTo(Receive())
@@ -196,7 +201,7 @@ func TestWaitForListWaitsForPendingDeletesOfAllKeys(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
 		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 		otherKey := client.ObjectKey{Namespace: "other", Name: "bar"}
 
@@ -204,7 +209,7 @@ func TestWaitForListWaitsForPendingDeletesOfAllKeys(t *testing.T) {
 		h.AddPendingDelete(otherKey, "uid-2")
 
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForList(ctx, 0) }()
+		go func() { result <- h.WaitForList(ctx) }()
 
 		synctest.Wait()
 		g.Expect(result).NotTo(Receive())
@@ -226,14 +231,14 @@ func TestWaitForListDoesNotWaitForPendingDeletesAddedAfterItWasCalled(t *testing
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
 		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 		otherKey := client.ObjectKey{Namespace: "other", Name: "bar"}
 
 		h.AddPendingDelete(key, "uid-1")
 
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForList(ctx, 0) }()
+		go func() { result <- h.WaitForList(ctx) }()
 		synctest.Wait()
 
 		g.Expect(result).NotTo(Receive())
@@ -252,13 +257,13 @@ func TestWaitForListIsUnblockedByRemovePendingDelete(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
 		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 
 		h.AddPendingDelete(key, "uid-1")
 
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForList(ctx, 0) }()
+		go func() { result <- h.WaitForList(ctx) }()
 
 		synctest.Wait()
 		g.Expect(result).NotTo(Receive())
@@ -276,13 +281,13 @@ func TestWaitForGetIsUnblockedByRemovePendingDelete(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		h := NewHandler(func(int64) {}, logr.Discard())
+		h := NewHandler(logr.Discard())
 		key := client.ObjectKey{Namespace: "default", Name: "foo"}
 
 		h.AddPendingDelete(key, "uid-1")
 
 		result := make(chan error, 1)
-		go func() { result <- h.WaitForGet(ctx, key, 0) }()
+		go func() { result <- h.WaitForGet(ctx, key) }()
 
 		synctest.Wait()
 		g.Expect(result).NotTo(Receive())

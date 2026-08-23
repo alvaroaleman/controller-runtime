@@ -70,8 +70,12 @@ func (dbt *delegatingByGVKCache) GetInformer(ctx context.Context, obj client.Obj
 	return cache.GetInformer(ctx, obj, opts...)
 }
 
-func (dbt *delegatingByGVKCache) SetMinimumRVForGVKAndKey(gvk schema.GroupVersionKind, key client.ObjectKey, rv int64) {
-	dbt.cacheForGVK(gvk).SetMinimumRVForGVKAndKey(gvk, key, rv)
+func (dbt *delegatingByGVKCache) SetMinimumRVForObject(obj client.Object, rv int64) error {
+	gvk, err := apiutil.GVKForObject(obj, dbt.scheme)
+	if err != nil {
+		return fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
+	}
+	return dbt.cacheForGVK(gvk).SetMinimumRVForObject(obj, rv)
 }
 
 func (dbt *delegatingByGVKCache) AddRequiredDeleteForObject(obj client.Object) error {

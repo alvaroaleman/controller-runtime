@@ -30,13 +30,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func NewHandler(rvCleanup func(int64), log logr.Logger) *ConsistencyHandler {
+func NewHandler(log logr.Logger) *ConsistencyHandler {
 	return &ConsistencyHandler{
 		rvBroadCaster:             &broadcaster{},
 		pendingDeletesBroadcaster: &broadcaster{},
 		pendingDeletesLock:        sync.RWMutex{},
 		pendingDeletes:            make(map[client.ObjectKey]sets.Set[types.UID]),
-		rvCleanup:                 rvCleanup,
+		minimumRVsLock:            sync.Mutex{},
+		minimumRVs:                make(map[client.ObjectKey]int64),
 		log:                       log,
 	}
 }
@@ -50,9 +51,45 @@ type ConsistencyHandler struct {
 	// pendingDeletes holds pending deletes. Must only be acquired when holding pendingDeletesLock
 	pendingDeletes map[client.ObjectKey]sets.Set[types.UID]
 
-	rvCleanup func(int64)
+	minimumRVsLock sync.Mutex
+	// minimumRVs stores the minimum RVs we must have seen before returning reads.
+	minimumRVs map[client.ObjectKey]int64
 
 	log logr.Logger
+}
+
+func (h *ConsistencyHandler) SetMinimumRV(key client.ObjectKey, rv int64) {
+	h.minimumRVsLock.Lock()
+	defer h.minimumRVsLock.Unlock()
+	h.minimumRVs[key] = rv
+}
+
+func (h *ConsistencyHandler) getMinimumRVForKey(key client.ObjectKey) int64 {
+	h.minimumRVsLock.Lock()
+	defer h.minimumRVsLock.Unlock()
+	return h.minimumRVs[key]
+}
+
+func (h *ConsistencyHandler) getMinimumRVForGVK() int64 {
+	h.minimumRVsLock.Lock()
+	defer h.minimumRVsLock.Unlock()
+	var maxRV int64
+	for _, rv := range h.minimumRVs {
+		if rv > maxRV {
+			maxRV = rv
+		}
+	}
+	return maxRV
+}
+
+func (h *ConsistencyHandler) cleanupMinimumRVs(currentRV int64) {
+	h.minimumRVsLock.Lock()
+	defer h.minimumRVsLock.Unlock()
+	for key, rv := range h.minimumRVs {
+		if rv <= currentRV {
+			delete(h.minimumRVs, key)
+		}
+	}
 }
 
 func (h *ConsistencyHandler) AddPendingDelete(key client.ObjectKey, uid types.UID) {
@@ -79,16 +116,16 @@ func (h *ConsistencyHandler) RemovePendingDelete(key client.ObjectKey, uid types
 	}
 }
 
-func (h *ConsistencyHandler) WaitForList(ctx context.Context, minRV int64) error {
-	if err := h.waitForRV(ctx, minRV); err != nil {
+func (h *ConsistencyHandler) WaitForList(ctx context.Context) error {
+	if err := h.waitForRV(ctx, h.getMinimumRVForGVK()); err != nil {
 		return err
 	}
 
 	return h.waitAllDeletes(ctx)
 }
 
-func (h *ConsistencyHandler) WaitForGet(ctx context.Context, key client.ObjectKey, minRV int64) error {
-	if err := h.waitForRV(ctx, minRV); err != nil {
+func (h *ConsistencyHandler) WaitForGet(ctx context.Context, key client.ObjectKey) error {
+	if err := h.waitForRV(ctx, h.getMinimumRVForKey(key)); err != nil {
 		return err
 	}
 
@@ -204,7 +241,7 @@ func (h *ConsistencyHandler) observeResourceVersion(rv string) {
 
 	h.rvBroadCaster.broadcast()
 
-	go h.rvCleanup(parsed)
+	go h.cleanupMinimumRVs(parsed)
 }
 
 func (h *ConsistencyHandler) OnAdd(raw any, _ bool) {

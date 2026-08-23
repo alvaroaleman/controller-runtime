@@ -77,7 +77,7 @@ func (ic *informerCache) Get(ctx context.Context, key client.ObjectKey, out clie
 		return &ErrCacheNotStarted{}
 	}
 
-	return cache.Reader.Get(ctx, key, out, ic.Informers.MinimumRVs.GetForKey(gvk, key), opts...)
+	return cache.Reader.Get(ctx, key, out, opts...)
 }
 
 // List implements Reader.
@@ -96,7 +96,7 @@ func (ic *informerCache) List(ctx context.Context, out client.ObjectList, opts .
 		return &ErrCacheNotStarted{}
 	}
 
-	return cache.Reader.List(ctx, out, ic.Informers.MinimumRVs.GetMaxForGVK(*gvk), opts...)
+	return cache.Reader.List(ctx, out, opts...)
 }
 
 // objectTypeForListObject tries to find the runtime.Object and associated GVK
@@ -178,8 +178,14 @@ func (ic *informerCache) getInformerForKind(ctx context.Context, gvk schema.Grou
 	return started, cache, nil
 }
 
-func (ic *informerCache) SetMinimumRVForGVKAndKey(gvk schema.GroupVersionKind, key client.ObjectKey, rv int64) {
-	ic.MinimumRVs.Set(gvk, key, rv)
+func (ic *informerCache) SetMinimumRVForObject(obj client.Object, rv int64) error {
+	gvk, err := apiutil.GVKForObject(obj, ic.scheme)
+	if err != nil {
+		return fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
+	}
+	h := ic.Informers.GetConsistencyHandler(gvk, obj)
+	h.SetMinimumRV(client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, rv)
+	return nil
 }
 
 func (ic *informerCache) AddRequiredDeleteForObject(obj client.Object) error {
