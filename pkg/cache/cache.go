@@ -68,31 +68,6 @@ type Cache interface {
 	Informers
 }
 
-// internalCache is implemented by all cache implementations in controller-runtime. It
-// adds the requirement methods to be able to work for a consistent client.
-type internalCache interface {
-	Cache
-	// SetMinimumRVForObject causes subsequent Get requests for the given
-	// object's key to block until the informer for that object's GVK has
-	// observed a resource version >= rv (or the context times out). For List
-	// requests on the given GVK, it blocks until the highest minimum RV across
-	// all keys for that GVK has been observed.
-	SetMinimumRVForObject(obj client.Object, rv int64) error
-
-	// AddRequiredDeleteForGVKKeyAndUID causes subsequent Get requests for the
-	// given GVK and key to block until the UID has been observed as deleted.
-	// For List requests on the given GVK, it blocks until all pending delete
-	// UIDs across all keys for that GVK have been observed.
-	//
-	//
-	// An informer for the given object must have been created before the delete
-	// added here was executed, otherwise this will cause a deadlock.
-	AddRequiredDeleteForObject(obj client.Object) error
-
-	// RemoveRequiredDeleteForObject removes a previously added pending delete.
-	RemoveRequiredDeleteForObject(obj client.Object) error
-}
-
 // Informers knows how to create or fetch informers for different
 // group-version-kinds, and add indices to those informers.  It's safe to call
 // GetInformer from multiple threads.
@@ -398,7 +373,7 @@ func New(cfg *rest.Config, opts Options) (Cache, error) {
 
 	newCacheFunc := newCache(cfg, opts)
 
-	var defaultCache internalCache
+	var defaultCache Cache
 	if len(opts.DefaultNamespaces) > 0 {
 		defaultConfig := optionDefaultsToConfig(&opts)
 		defaultCache = newMultiNamespaceCache(newCacheFunc, opts.Scheme, opts.Mapper, opts.DefaultNamespaces, &defaultConfig)
@@ -412,7 +387,7 @@ func New(cfg *rest.Config, opts Options) (Cache, error) {
 
 	delegating := &delegatingByGVKCache{
 		scheme:       opts.Scheme,
-		caches:       make(map[schema.GroupVersionKind]internalCache, len(opts.ByObject)),
+		caches:       make(map[schema.GroupVersionKind]Cache, len(opts.ByObject)),
 		defaultCache: defaultCache,
 	}
 
@@ -421,7 +396,7 @@ func New(cfg *rest.Config, opts Options) (Cache, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to get GVK for type %T: %w", obj, err)
 		}
-		var cache internalCache
+		var cache Cache
 		if len(config.Namespaces) > 0 {
 			cache = newMultiNamespaceCache(newCacheFunc, opts.Scheme, opts.Mapper, config.Namespaces, nil)
 		} else {
@@ -469,10 +444,10 @@ func byObjectToConfig(byObject ByObject) Config {
 	}
 }
 
-type newCacheFunc func(config Config, namespace string) internalCache
+type newCacheFunc func(config Config, namespace string) Cache
 
 func newCache(restConfig *rest.Config, opts Options) newCacheFunc {
-	return func(config Config, namespace string) internalCache {
+	return func(config Config, namespace string) Cache {
 		return &informerCache{
 			scheme: opts.Scheme,
 			Informers: internal.NewInformers(restConfig, &internal.InformersOpts{

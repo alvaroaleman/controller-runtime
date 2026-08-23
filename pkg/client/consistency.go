@@ -25,20 +25,17 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/client/internal/consistencyhandler"
 )
-
-type cache interface {
-	SetMinimumRVForObject(obj Object, rv int64) error
-	AddRequiredDeleteForObject(Object) error
-	RemoveRequiredDeleteForObject(Object) error
-}
 
 type consistentClientUpstream interface {
 	Client
@@ -54,26 +51,49 @@ type keyLock interface {
 
 var _ Client = (*consistentClient)(nil)
 
-func newConsistentClient(upstream consistentClientUpstream, c cache, newKeyLock func() keyLock) *consistentClient {
-	if newKeyLock == nil {
-		newKeyLock = func() keyLock { return &keyLocker{} }
-	}
-
+func newConsistentClient(
+	upstream consistentClientUpstream,
+	informers cacheapi.Informers,
+	newKeyLock func() keyLock,
+	log logr.Logger,
+) *consistentClient {
 	return &consistentClient{
-		upstream: upstream,
-		cache:    c,
+		upstream:  upstream,
+		informers: informers,
 		lockedKeysByGVK: newThreadSafeMap[schema.GroupVersionKind](func() *threadSafeMap[types.NamespacedName, keyLock] {
 			return newThreadSafeMap[types.NamespacedName](newKeyLock)
+		}),
+		consistencyHandlers: newThreadSafeMap[schema.GroupVersionKind](func() *consistencyhandler.ConsistencyHandler {
+			return consistencyhandler.NewHandler(log)
 		}),
 	}
 }
 
 type consistentClient struct {
-	upstream consistentClientUpstream
-	cache    cache
+	upstream  consistentClientUpstream
+	informers cacheapi.Informers
 
 	// lockedKeysByGVK maps gvk -> key -> keyLock
 	lockedKeysByGVK *threadSafeMap[schema.GroupVersionKind, *threadSafeMap[types.NamespacedName, keyLock]]
+
+	consistencyHandlers *threadSafeMap[schema.GroupVersionKind, *consistencyhandler.ConsistencyHandler]
+}
+
+func (c *consistentClient) getConsistencyHandler(ctx context.Context, gvk schema.GroupVersionKind, obj cacheapi.Object) (*consistencyhandler.ConsistencyHandler, error) {
+	h := c.consistencyHandlers.getOrCreate(gvk)
+	if h.Registered() {
+		return h, nil
+	}
+
+	informer, err := c.informers.GetInformer(ctx, obj, cacheapi.BlockUntilSynced(true))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get informer for GVK %s: %w", gvk, err)
+	}
+
+	if err := h.Register(ctx, informer); err != nil {
+		return nil, fmt.Errorf("failed to register consistency handler on informer for GVK %s: %w", gvk, err)
+	}
+	return h, nil
 }
 
 func (c *consistentClient) Get(ctx context.Context, key ObjectKey, obj Object, opts ...GetOption) error {
@@ -84,6 +104,14 @@ func (c *consistentClient) Get(ctx context.Context, key ObjectKey, obj Object, o
 
 	keyLock := c.lockedKeysByGVK.getOrCreate(gvk).getOrCreate(key)
 	if err := keyLock.Wait(ctx); err != nil {
+		return err
+	}
+
+	h, err := c.getConsistencyHandler(ctx, gvk, obj)
+	if err != nil {
+		return err
+	}
+	if err := h.WaitForGet(ctx, key); err != nil {
 		return err
 	}
 
@@ -102,6 +130,23 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 		if err := keyLock.Wait(ctx); err != nil {
 			return err
 		}
+	}
+
+	listObj, err := c.upstream.Scheme().New(gvk)
+	if err != nil {
+		return fmt.Errorf("failed to create object for GVK %s: %w", gvk, err)
+	}
+	cacheObj, ok := listObj.(cacheapi.Object)
+	if !ok {
+		return fmt.Errorf("object of type %T for GVK %s does not implement cacheapi.Object", listObj, gvk)
+	}
+
+	h, err := c.getConsistencyHandler(ctx, gvk, cacheObj)
+	if err != nil {
+		return err
+	}
+	if err := h.WaitForList(ctx); err != nil {
+		return err
 	}
 
 	return c.upstream.List(ctx, list, opts...)
@@ -198,9 +243,12 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 	if err != nil {
 		return fmt.Errorf("failed to parse resource version %s: %w", rvRaw, err)
 	}
-	if err := c.cache.SetMinimumRVForObject(cacheObj, rv); err != nil {
-		return fmt.Errorf("failed to set minimum resource version: %w", err)
+
+	h, err := c.getConsistencyHandler(ctx, gvk, cacheObj)
+	if err != nil {
+		return err
 	}
+	h.SetMinimumRV(ObjectKey{Namespace: cacheObj.GetNamespace(), Name: cacheObj.GetName()}, rv)
 
 	return nil
 }
@@ -240,31 +288,28 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 	}
 	defer keyLock.Unlock()
 
+	h, err := c.getConsistencyHandler(ctx, gvk, obj)
+	if err != nil {
+		return err
+	}
+
 	// Register the delete before we execute it, otherwise it may be in the cache
 	// before we register it, causing a deadlock.
-	if err := c.cache.AddRequiredDeleteForObject(obj); err != nil {
-		return fmt.Errorf("failed to add required delete for object: %w", err)
-	}
+	h.AddPendingDelete(ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, obj.GetUID())
 
 	response, err := c.upstream.delete(ctx, obj, opts...)
 	if err != nil {
-		if removeErr := c.cache.RemoveRequiredDeleteForObject(obj); removeErr != nil {
-			return errors.Join(err, fmt.Errorf("failed to remove required delete for object after delete error: %w", removeErr))
-		}
+		h.RemovePendingDelete(ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, obj.GetUID())
 		return err
 	}
 
 	if rvRaw := response.GetResourceVersion(); rvRaw != "" {
-		if err := c.cache.RemoveRequiredDeleteForObject(obj); err != nil {
-			return fmt.Errorf("failed to remove required delete for object after successful delete: %w", err)
-		}
+		h.RemovePendingDelete(ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, obj.GetUID())
 		rv, err := strconv.ParseInt(rvRaw, 10, 64)
 		if err != nil {
 			return fmt.Errorf("failed to parse resource version %s: %w", rvRaw, err)
 		}
-		if err := c.cache.SetMinimumRVForObject(obj, rv); err != nil {
-			return fmt.Errorf("failed to set minimum resource version: %w", err)
-		}
+		h.SetMinimumRV(ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, rv)
 	}
 
 	return nil

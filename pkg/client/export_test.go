@@ -19,12 +19,12 @@ package client
 import (
 	"context"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
 )
 
 type (
-	// ConsistencyCache is the cache the consistent client records its writes in.
-	ConsistencyCache = cache
 	// KeyLock is the per key lock the consistent client serializes on.
 	KeyLock = keyLock
 	// KeyLocker is the implementation of KeyLock the client uses
@@ -49,7 +49,6 @@ func (u upstreamClientShim) delete(ctx context.Context, obj Object, opts ...Dele
 }
 
 // NewConsistentClient constructs a consistent client on top of an arbitrary upstream.
-// Passing a nil newKeyLock uses the same locks the production code uses.
-func NewConsistentClient(upstream UpstreamClient, c ConsistencyCache, newKeyLock func() KeyLock) Client {
-	return newConsistentClient(upstreamClientShim{upstream}, c, newKeyLock)
+func NewConsistentClient(upstream UpstreamClient, informers cacheapi.Informers, newKeyLock func() KeyLock) Client {
+	return newConsistentClient(upstreamClientShim{upstream}, informers, newKeyLock, logr.Discard())
 }

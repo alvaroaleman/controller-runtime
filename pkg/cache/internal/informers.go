@@ -39,7 +39,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
-	"sigs.k8s.io/controller-runtime/pkg/cache/internal/readerconsistency"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/internal/log"
 	"sigs.k8s.io/controller-runtime/pkg/internal/syncs"
@@ -92,18 +91,17 @@ func NewInformers(config *rest.Config, options *InformersOpts) *Informers {
 			Unstructured: make(map[schema.GroupVersionKind]*Cache),
 			Metadata:     make(map[schema.GroupVersionKind]*Cache),
 		},
-		codecs:                     serializer.NewCodecFactory(options.Scheme),
-		paramCodec:                 runtime.NewParameterCodec(options.Scheme),
-		resync:                     options.ResyncPeriod,
-		startWait:                  make(chan struct{}),
-		namespace:                  options.Namespace,
-		selector:                   options.Selector,
-		transform:                  options.Transform,
-		unsafeDisableDeepCopy:      options.UnsafeDisableDeepCopy,
-		enableWatchBookmarks:       options.EnableWatchBookmarks,
-		newInformer:                newInformer,
-		watchErrorHandler:          options.WatchErrorHandler,
-		pendingConsistencyHandlers: newConsistencyHandlerTracker(),
+		codecs:                serializer.NewCodecFactory(options.Scheme),
+		paramCodec:            runtime.NewParameterCodec(options.Scheme),
+		resync:                options.ResyncPeriod,
+		startWait:             make(chan struct{}),
+		namespace:             options.Namespace,
+		selector:              options.Selector,
+		transform:             options.Transform,
+		unsafeDisableDeepCopy: options.UnsafeDisableDeepCopy,
+		enableWatchBookmarks:  options.EnableWatchBookmarks,
+		newInformer:           newInformer,
+		watchErrorHandler:     options.WatchErrorHandler,
 	}
 }
 
@@ -135,31 +133,6 @@ type tracker struct {
 	Structured   map[schema.GroupVersionKind]*Cache
 	Unstructured map[schema.GroupVersionKind]*Cache
 	Metadata     map[schema.GroupVersionKind]*Cache
-}
-
-type consistencyHandlerTracker struct {
-	Structured   map[schema.GroupVersionKind]*readerconsistency.ConsistencyHandler
-	Unstructured map[schema.GroupVersionKind]*readerconsistency.ConsistencyHandler
-	Metadata     map[schema.GroupVersionKind]*readerconsistency.ConsistencyHandler
-}
-
-func newConsistencyHandlerTracker() consistencyHandlerTracker {
-	return consistencyHandlerTracker{
-		Structured:   make(map[schema.GroupVersionKind]*readerconsistency.ConsistencyHandler),
-		Unstructured: make(map[schema.GroupVersionKind]*readerconsistency.ConsistencyHandler),
-		Metadata:     make(map[schema.GroupVersionKind]*readerconsistency.ConsistencyHandler),
-	}
-}
-
-func (t *consistencyHandlerTracker) forType(obj runtime.Object) map[schema.GroupVersionKind]*readerconsistency.ConsistencyHandler {
-	switch obj.(type) {
-	case runtime.Unstructured:
-		return t.Unstructured
-	case *metav1.PartialObjectMetadata, *metav1.PartialObjectMetadataList:
-		return t.Metadata
-	default:
-		return t.Structured
-	}
 }
 
 // GetOptions provides configuration to customize the behavior when
@@ -230,12 +203,6 @@ type Informers struct {
 	// watchErrorHandler to be set by overriding the options
 	// or to use the default watchErrorHandler
 	watchErrorHandler cache.WatchErrorHandlerWithContext
-
-	// pendingConsistencyHandlers stores ConsistencyHandlers for GVKs that
-	// don't have an informer yet. When the informer is created, the handler
-	// is reused so that minimum RVs set before the informer existed are
-	// preserved. Guarded by mu.
-	pendingConsistencyHandlers consistencyHandlerTracker
 }
 
 // Start calls Run on each of the informers and sets started to true. Blocks on the context.
@@ -335,27 +302,6 @@ func (ip *Informers) Peek(gvk schema.GroupVersionKind, obj runtime.Object) (res 
 	defer ip.mu.RUnlock()
 	i, ok := ip.informersByType(obj)[gvk]
 	return i, ip.started, ok
-}
-
-// GetConsistencyHandler returns the ConsistencyHandler for the given GVK and
-// object type. If no informer exists for the GVK, a new handler is created and
-// stored as pending so it can be reused when the informer is created later.
-func (ip *Informers) GetConsistencyHandler(gvk schema.GroupVersionKind, obj runtime.Object) *readerconsistency.ConsistencyHandler {
-	ip.mu.Lock()
-	defer ip.mu.Unlock()
-
-	if c, ok := ip.informersByType(obj)[gvk]; ok {
-		return c.Reader.ConsistencyHandler
-	}
-
-	pending := ip.pendingConsistencyHandlers.forType(obj)
-	if h, ok := pending[gvk]; ok {
-		return h
-	}
-
-	h := readerconsistency.NewHandler(log.WithName("readerconsistencyhandler").WithValues("gvk", gvk.String()))
-	pending[gvk] = h
-	return h
 }
 
 // Get will create a new Informer and add it to the map of specificInformersMap if none exists. Returns
@@ -464,26 +410,14 @@ func (ip *Informers) addInformerToMap(gvk schema.GroupVersionKind, obj runtime.O
 		return nil, false, err
 	}
 
-	pendingHandlers := ip.pendingConsistencyHandlers.forType(obj)
-	consistencyHandler := pendingHandlers[gvk]
-	if consistencyHandler != nil {
-		delete(pendingHandlers, gvk)
-	} else {
-		consistencyHandler = readerconsistency.NewHandler(log.WithName("readerconsistencyhandler").WithValues("gvk", gvk.String()))
-	}
-	if _, err := sharedIndexInformer.AddEventHandler(consistencyHandler); err != nil {
-		return nil, false, fmt.Errorf("failed to add readerconsistency handler: %w", err)
-	}
-
 	// Create the new entry and set it in the map.
 	i := &Cache{
 		Informer: sharedIndexInformer,
 		Reader: CacheReader{
-			indexer:            sharedIndexInformer.GetIndexer(),
-			groupVersionKind:   gvk,
-			scopeName:          mapping.Scope.Name(),
-			disableDeepCopy:    ip.unsafeDisableDeepCopy,
-			ConsistencyHandler: consistencyHandler,
+			indexer:          sharedIndexInformer.GetIndexer(),
+			groupVersionKind: gvk,
+			scopeName:        mapping.Scope.Name(),
+			disableDeepCopy:  ip.unsafeDisableDeepCopy,
 		},
 		stop: make(chan struct{}),
 	}
