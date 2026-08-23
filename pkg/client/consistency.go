@@ -35,7 +35,7 @@ import (
 )
 
 type cache interface {
-	SetMinimumRVForGVKAndKey(gvk schema.GroupVersionKind, key ObjectKey, rv int64)
+	SetMinimumRVForObject(obj Object, rv int64) error
 	AddRequiredDeleteForObject(Object) error
 	RemoveRequiredDeleteForObject(Object) error
 }
@@ -131,38 +131,51 @@ func (c *consistentClient) Apply(ctx context.Context, obj runtime.ApplyConfigura
 	})
 }
 
-func writeTargetFor(obj any, scheme *runtime.Scheme) (schema.GroupVersionKind, types.NamespacedName, func() (string, error), error) {
+func writeTargetFor(obj any, scheme *runtime.Scheme) (schema.GroupVersionKind, types.NamespacedName, Object, func() (string, error), error) {
 	switch t := obj.(type) {
 	case *unstructuredApplyConfiguration:
 		return t.Unstructured.GroupVersionKind(),
 			types.NamespacedName{Namespace: t.Unstructured.GetNamespace(), Name: t.Unstructured.GetName()},
+			t.Unstructured,
 			func() (string, error) { return t.Unstructured.GetResourceVersion(), nil },
 			nil
 	case applyConfiguration:
 		gvk, err := gvkFromApplyConfiguration(t)
 		if err != nil {
-			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, fmt.Errorf("failed to get GVK for apply configuration %T: %w", obj, err)
+			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to get GVK for apply configuration %T: %w", obj, err)
 		}
+		cacheObj, err := scheme.New(gvk)
+		if err != nil {
+			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to create cache object for GVK %s: %w", gvk, err)
+		}
+		clientObj, ok := cacheObj.(Object)
+		if !ok {
+			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("cache object of type %T for GVK %s does not implement client.Object", cacheObj, gvk)
+		}
+		clientObj.SetName(ptr.Deref(t.GetName(), ""))
+		clientObj.SetNamespace(ptr.Deref(t.GetNamespace(), ""))
 		return gvk,
 			types.NamespacedName{Namespace: ptr.Deref(t.GetNamespace(), ""), Name: ptr.Deref(t.GetName(), "")},
+			clientObj,
 			func() (string, error) { return resourceVersionFromApplyConfiguration(t) },
 			nil
 	case Object:
 		gvk, err := apiutil.GVKForObject(t, scheme)
 		if err != nil {
-			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
+			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
 		}
 		return gvk,
 			types.NamespacedName{Namespace: t.GetNamespace(), Name: t.GetName()},
+			t,
 			func() (string, error) { return t.GetResourceVersion(), nil },
 			nil
 	default:
-		return schema.GroupVersionKind{}, types.NamespacedName{}, nil, fmt.Errorf("unsupported type %T, must be either %T, %T or %T", obj, Object(nil), &unstructuredApplyConfiguration{}, applyConfiguration(nil))
+		return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("unsupported type %T, must be either %T, %T or %T", obj, Object(nil), &unstructuredApplyConfiguration{}, applyConfiguration(nil))
 	}
 }
 
 func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write func() error) error {
-	gvk, namespacedName, getResourceVersion, err := writeTargetFor(obj, c.upstream.Scheme())
+	gvk, namespacedName, cacheObj, getResourceVersion, err := writeTargetFor(obj, c.upstream.Scheme())
 	if err != nil {
 		return err
 	}
@@ -185,7 +198,9 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 	if err != nil {
 		return fmt.Errorf("failed to parse resource version %s: %w", rvRaw, err)
 	}
-	c.cache.SetMinimumRVForGVKAndKey(gvk, namespacedName, rv)
+	if err := c.cache.SetMinimumRVForObject(cacheObj, rv); err != nil {
+		return fmt.Errorf("failed to set minimum resource version: %w", err)
+	}
 
 	return nil
 }
@@ -247,7 +262,9 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 		if err != nil {
 			return fmt.Errorf("failed to parse resource version %s: %w", rvRaw, err)
 		}
-		c.cache.SetMinimumRVForGVKAndKey(gvk, namespacedName, rv)
+		if err := c.cache.SetMinimumRVForObject(obj, rv); err != nil {
+			return fmt.Errorf("failed to set minimum resource version: %w", err)
+		}
 	}
 
 	return nil

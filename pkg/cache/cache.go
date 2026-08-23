@@ -74,12 +74,12 @@ type Cache interface {
 // adds the requirement methods to be able to work for a consistent client.
 type internalCache interface {
 	Cache
-	// SetMinimumRVForGVKAndKey causes subsequent Get requests for the given
-	// GVK and key to block until the informer for that GVK has observed a
-	// resource version >= rv (or the context times out). For List requests
-	// on the given GVK, it blocks until the highest minimum RV across all
-	// keys for that GVK has been observed.
-	SetMinimumRVForGVKAndKey(gvk schema.GroupVersionKind, key client.ObjectKey, rv int64)
+	// SetMinimumRVForObject causes subsequent Get requests for the given
+	// object's key to block until the informer for that object's GVK has
+	// observed a resource version >= rv (or the context times out). For List
+	// requests on the given GVK, it blocks until the highest minimum RV across
+	// all keys for that GVK has been observed.
+	SetMinimumRVForObject(obj client.Object, rv int64) error
 
 	// AddRequiredDeleteForGVKKeyAndUID causes subsequent Get requests for the
 	// given GVK and key to block until the UID has been observed as deleted.

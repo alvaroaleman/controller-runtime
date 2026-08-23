@@ -55,7 +55,7 @@ type CacheReader struct {
 }
 
 // Get checks the indexer for the object and writes a copy of it if found.
-func (c *CacheReader) Get(ctx context.Context, key client.ObjectKey, out client.Object, minRV int64, opts ...client.GetOption) error {
+func (c *CacheReader) Get(ctx context.Context, key client.ObjectKey, out client.Object, opts ...client.GetOption) error {
 	getOpts := client.GetOptions{}
 	getOpts.ApplyOptions(opts)
 
@@ -64,7 +64,7 @@ func (c *CacheReader) Get(ctx context.Context, key client.ObjectKey, out client.
 	}
 	storeKey := objectKeyToStoreKey(key)
 
-	if err := c.ConsistencyHandler.WaitForGet(ctx, key, minRV); err != nil {
+	if err := c.ConsistencyHandler.WaitForGet(ctx, key); err != nil {
 		return err
 	}
 
@@ -113,7 +113,7 @@ func (c *CacheReader) Get(ctx context.Context, key client.ObjectKey, out client.
 }
 
 // List lists items out of the indexer and writes them to out.
-func (c *CacheReader) List(ctx context.Context, out client.ObjectList, minRV int64, opts ...client.ListOption) error {
+func (c *CacheReader) List(ctx context.Context, out client.ObjectList, opts ...client.ListOption) error {
 	var objs []any
 	var err error
 
@@ -124,7 +124,7 @@ func (c *CacheReader) List(ctx context.Context, out client.ObjectList, minRV int
 		return fmt.Errorf("continue list option is not supported by the cache")
 	}
 
-	if err := c.ConsistencyHandler.WaitForList(ctx, minRV); err != nil {
+	if err := c.ConsistencyHandler.WaitForList(ctx); err != nil {
 		return err
 	}
 
