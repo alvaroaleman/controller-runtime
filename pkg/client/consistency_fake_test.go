@@ -49,7 +49,7 @@ const watchDelay = 10 * time.Second
 // and a fake cache that delivers events with a 10 second delay.
 func newConsistentFakeClient(
 	t *testing.T,
-	locker client.KeyLock,
+	barrier client.WriteBarrier,
 	initObjects ...client.Object,
 ) client.Client {
 	t.Helper()
@@ -64,7 +64,7 @@ func newConsistentFakeClient(
 	return client.NewConsistentClient(
 		&fakeConsistentClientUpstream{Client: upstream},
 		fc,
-		func() client.KeyLock { return locker },
+		func() client.WriteBarrier { return barrier },
 	)
 }
 
@@ -240,18 +240,18 @@ func (fakeDoneChecker) Done() <-chan struct{} {
 	return ch
 }
 
-type keyLockerWithLockCallback struct {
-	client.KeyLocker
-	lockCallback func()
+type keyWriteBarrierWithBeginCallback struct {
+	client.KeyWriteBarrier
+	beginCallback func()
 }
 
-func (k *keyLockerWithLockCallback) Lock(ctx context.Context) error {
-	err := k.KeyLocker.Lock(ctx)
-	k.lockCallback()
-	return err
+func (k *keyWriteBarrierWithBeginCallback) Begin() func() {
+	release := k.KeyWriteBarrier.Begin()
+	k.beginCallback()
+	return release
 }
 
-// TestConsistentFakeClient uses a callback on the Lock acquisition of a write operation
+// TestConsistentFakeClient uses a callback on the start of a write operation
 // to start a read operation, then validates the read operation observes the write.
 // It uses a fake cache with a fixed ten seconds delay in synctest, to avoid having to
 // wait ten seconds of wallclock time.
@@ -498,20 +498,20 @@ func TestConsistentFakeClient(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
 				g := NewWithT(t)
-				locker := keyLockerWithLockCallback{}
+				barrier := keyWriteBarrierWithBeginCallback{}
 
 				var initObjects []client.Object
 				if tc.maybeInitObject != nil {
 					initObjects = []client.Object{tc.maybeInitObject()}
 				}
-				c := newConsistentFakeClient(t, &locker, initObjects...)
+				c := newConsistentFakeClient(t, &barrier, initObjects...)
 				synctest.Wait() // wait for cache start to finish
 
 				writtenRV := make(chan int64, 1)
 				callBackFinished := make(chan struct{})
-				locker.lockCallback = sync.OnceFunc(func() {
-					// Must happen in a goroutine otherwise we deadlock, as we are waiting for the write to release the lock while
-					// blocking it from finishing the acquisition.
+				barrier.beginCallback = sync.OnceFunc(func() {
+					// Must happen in a goroutine otherwise we deadlock, as we are waiting for the write to finish while
+					// blocking it from starting.
 					go func() {
 						defer close(callBackFinished)
 

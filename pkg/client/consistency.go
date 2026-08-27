@@ -43,10 +43,9 @@ type consistentClientUpstream interface {
 	delete(ctx context.Context, obj Object, opts ...DeleteOption) (*unstructured.Unstructured, error)
 }
 
-type keyLock interface {
-	Lock(ctx context.Context) error
-	Unlock()
-	Wait(ctx context.Context) error
+type writeBarrier interface {
+	Begin() (release func())
+	Seal() <-chan struct{}
 }
 
 var _ Client = (*consistentClient)(nil)
@@ -54,14 +53,14 @@ var _ Client = (*consistentClient)(nil)
 func newConsistentClient(
 	upstream consistentClientUpstream,
 	informers cacheapi.Informers,
-	newKeyLock func() keyLock,
+	newWriteBarrier func() writeBarrier,
 	log logr.Logger,
 ) *consistentClient {
 	return &consistentClient{
 		upstream:  upstream,
 		informers: informers,
-		lockedKeysByGVK: newThreadSafeMap[schema.GroupVersionKind](func() *threadSafeMap[types.NamespacedName, keyLock] {
-			return newThreadSafeMap[types.NamespacedName](newKeyLock)
+		writeBarriersByGVK: newThreadSafeMap[schema.GroupVersionKind](func() *threadSafeMap[types.NamespacedName, writeBarrier] {
+			return newThreadSafeMap[types.NamespacedName](newWriteBarrier)
 		}),
 		consistencyHandlers: newThreadSafeMap[schema.GroupVersionKind](func() *consistencyhandler.ConsistencyHandler {
 			return consistencyhandler.NewHandler(log)
@@ -73,8 +72,8 @@ type consistentClient struct {
 	upstream  consistentClientUpstream
 	informers cacheapi.Informers
 
-	// lockedKeysByGVK maps gvk -> key -> keyLock
-	lockedKeysByGVK *threadSafeMap[schema.GroupVersionKind, *threadSafeMap[types.NamespacedName, keyLock]]
+	// writeBarriersByGVK maps gvk -> key -> writeBarrier
+	writeBarriersByGVK *threadSafeMap[schema.GroupVersionKind, *threadSafeMap[types.NamespacedName, writeBarrier]]
 
 	consistencyHandlers *threadSafeMap[schema.GroupVersionKind, *consistencyhandler.ConsistencyHandler]
 }
@@ -102,9 +101,11 @@ func (c *consistentClient) Get(ctx context.Context, key ObjectKey, obj Object, o
 		return fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
 	}
 
-	keyLock := c.lockedKeysByGVK.getOrCreate(gvk).getOrCreate(key)
-	if err := keyLock.Wait(ctx); err != nil {
-		return err
+	barrier := c.writeBarriersByGVK.getOrCreate(gvk).getOrCreate(key)
+	select {
+	case <-barrier.Seal():
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
 	h, err := c.getConsistencyHandler(ctx, gvk, obj)
@@ -125,10 +126,16 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 	}
 	gvk.Kind = strings.TrimSuffix(gvk.Kind, "List")
 
-	keys := c.lockedKeysByGVK.getOrCreate(gvk).allValues()
-	for _, keyLock := range keys {
-		if err := keyLock.Wait(ctx); err != nil {
-			return err
+	barriers := c.writeBarriersByGVK.getOrCreate(gvk).allValues()
+	sealed := make([]<-chan struct{}, 0, len(barriers))
+	for _, barrier := range barriers {
+		sealed = append(sealed, barrier.Seal())
+	}
+	for _, s := range sealed {
+		select {
+		case <-s:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 
@@ -225,11 +232,8 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 		return err
 	}
 
-	keyLock := c.lockedKeysByGVK.getOrCreate(gvk).getOrCreate(namespacedName)
-	if err := keyLock.Lock(ctx); err != nil {
-		return fmt.Errorf("failed to acquire lock for %s/%s: %w", namespacedName.Namespace, namespacedName.Name, err)
-	}
-	defer keyLock.Unlock()
+	release := c.writeBarriersByGVK.getOrCreate(gvk).getOrCreate(namespacedName).Begin()
+	defer release()
 
 	if err := write(); err != nil {
 		return err
@@ -282,11 +286,8 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 
 	namespacedName := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
 
-	keyLock := c.lockedKeysByGVK.getOrCreate(gvk).getOrCreate(namespacedName)
-	if err := keyLock.Lock(ctx); err != nil {
-		return fmt.Errorf("failed to acquire lock for %s/%s: %w", namespacedName.Namespace, namespacedName.Name, err)
-	}
-	defer keyLock.Unlock()
+	release := c.writeBarriersByGVK.getOrCreate(gvk).getOrCreate(namespacedName).Begin()
+	defer release()
 
 	h, err := c.getConsistencyHandler(ctx, gvk, obj)
 	if err != nil {
@@ -379,64 +380,67 @@ func (c *consistentSubResourceClient) Apply(ctx context.Context, obj runtime.App
 	})
 }
 
-// keyLocker implements a mutex with context support
-// that also allows to wait for the current lock to
-// be released.
-// TODO: find a better name
-type keyLocker struct {
-	// mutex must be held to access done
-	mutex sync.Mutex
-	// done is nil when no one is holding the lock
-	done chan struct{}
+var closedChannel chan struct{}
+
+func init() {
+	closedChannel = make(chan struct{})
+	close(closedChannel)
 }
 
-func (l *keyLocker) Lock(ctx context.Context) error {
-	for {
-		l.mutex.Lock()
-		if l.done == nil {
-			l.done = make(chan struct{})
-			l.mutex.Unlock()
-			return nil
-		}
+type writeBatch struct {
+	barrier  *keyWriteBarrier
+	inFlight int
+	done     chan struct{}
+}
 
-		done := l.done
-		l.mutex.Unlock()
-		select {
-		case <-done: // released, try acquire
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+func (w *writeBatch) release() {
+	w.barrier.mutex.Lock()
+	defer w.barrier.mutex.Unlock()
+
+	w.inFlight--
+	if w.inFlight > 0 {
+		return
+	}
+
+	close(w.done)
+	if w.barrier.current == w {
+		w.barrier.current = nil
 	}
 }
 
-func (l *keyLocker) Unlock() {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-
-	if l.done == nil {
-		panic("unlock of unlocked mutex")
-	}
-	close(l.done)
-	l.done = nil
+// keyWriteBarrier allows to wait for a set of in-flight writes to finish.
+type keyWriteBarrier struct {
+	// mutex must be held to access current
+	mutex   sync.Mutex
+	current *writeBatch
 }
 
-// Wait waits for the current lock holder if any to
-// release the lock.
-func (l *keyLocker) Wait(ctx context.Context) error {
-	l.mutex.Lock()
-	done := l.done
-	l.mutex.Unlock()
+// Begin adds a write to the current batch, starting one if needed.
+func (b *keyWriteBarrier) Begin() func() {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
 
-	if done == nil {
-		return nil
+	if b.current == nil {
+		b.current = &writeBatch{barrier: b, done: make(chan struct{})}
+	}
+	b.current.inFlight++
+
+	return b.current.release
+}
+
+// Seal seals the current write batch and returns a channel that closes
+// once all writes in the batch are done.
+func (b *keyWriteBarrier) Seal() <-chan struct{} {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	if b.current == nil {
+		return closedChannel
 	}
 
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	done := b.current.done
+	b.current = nil
+	return done
 }
 
 func newThreadSafeMap[k comparable, v any](newValue func() v) *threadSafeMap[k, v] {

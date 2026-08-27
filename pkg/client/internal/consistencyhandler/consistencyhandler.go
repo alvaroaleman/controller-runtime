@@ -103,7 +103,9 @@ func (h *ConsistencyHandler) waitForHandlerSyncLocked(ctx context.Context, regis
 func (h *ConsistencyHandler) SetMinimumRV(key types.NamespacedName, rv int64) {
 	h.minimumRVsLock.Lock()
 	defer h.minimumRVsLock.Unlock()
-	h.minimumRVs[key] = rv
+	if rv > h.minimumRVs[key] {
+		h.minimumRVs[key] = rv
+	}
 }
 
 func (h *ConsistencyHandler) getMinimumRVForKey(key types.NamespacedName) int64 {

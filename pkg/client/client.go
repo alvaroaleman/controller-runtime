@@ -253,7 +253,7 @@ func newClient(config *rest.Config, options Options) (Client, error) {
 	return newConsistentClient(
 		c,
 		informerCache,
-		func() keyLock { return &keyLocker{} },
+		func() writeBarrier { return &keyWriteBarrier{} },
 		options.Log,
 	), nil
 }

@@ -25,10 +25,10 @@ import (
 )
 
 type (
-	// KeyLock is the per key lock the consistent client serializes on.
-	KeyLock = keyLock
-	// KeyLocker is the implementation of KeyLock the client uses
-	KeyLocker = keyLocker
+	// WriteBarrier is the per key write barrier reads in the consistent client wait on.
+	WriteBarrier = writeBarrier
+	// KeyWriteBarrier is the implementation of WriteBarrier the client uses
+	KeyWriteBarrier = keyWriteBarrier
 )
 
 // UpstreamClient is what NewConsistentClient wraps. It mirrors the unexported
@@ -49,6 +49,6 @@ func (u upstreamClientShim) delete(ctx context.Context, obj Object, opts ...Dele
 }
 
 // NewConsistentClient constructs a consistent client on top of an arbitrary upstream.
-func NewConsistentClient(upstream UpstreamClient, informers cacheapi.Informers, newKeyLock func() KeyLock) Client {
-	return newConsistentClient(upstreamClientShim{upstream}, informers, newKeyLock, logr.Discard())
+func NewConsistentClient(upstream UpstreamClient, informers cacheapi.Informers, newWriteBarrier func() WriteBarrier) Client {
+	return newConsistentClient(upstreamClientShim{upstream}, informers, newWriteBarrier, logr.Discard())
 }
