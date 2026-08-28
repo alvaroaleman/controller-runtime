@@ -226,6 +226,12 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 		return err
 	}
 
+	// We don't technically need an informer since the RV is monotonically increasing, but we want to fail
+	// ASAP if the cache can not be setup.
+	if _, err := c.getConsistencyHandler(ctx, gvk, cacheObj); err != nil {
+		return err
+	}
+
 	release := c.writeBarriersByGVK.getOrCreate(gvk).Begin(namespacedName)
 	defer release()
 
