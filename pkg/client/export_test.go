@@ -24,6 +24,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
 )
 
+// The purpose of this file is purely to export a few private identifiers from package
+// client into package client_test. This is needed because the consistent client tests
+// must be in package client_test to avoid an import cycle, since they import the fake
+// client and the interceptor, both of which import pkg/client.
+
 type (
 	// WriteBarrier is the per key write barrier reads in the consistent client wait on.
 	WriteBarrier = writeBarrier
