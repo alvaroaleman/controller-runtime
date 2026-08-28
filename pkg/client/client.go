@@ -130,9 +130,17 @@ type NewClientFunc func(config *rest.Config, options Options) (Client, error)
 // corresponding group, version, and kind for the given type.  In the
 // case of unstructured types, the group, version, and kind will be extracted
 // from the corresponding fields on the object.
-func New(config *rest.Config, options Options) (c Client, err error) {
-	c, err = newClient(config, options)
-	if err == nil && options.DryRun != nil && *options.DryRun {
+func New(config *rest.Config, options Options) (Client, error) {
+	_, c, err := newClient(config, options)
+	if err != nil {
+		return nil, err
+	}
+
+	return wrapClient(c, options), nil
+}
+
+func wrapClient(c Client, options Options) Client {
+	if options.DryRun != nil && *options.DryRun {
 		c = NewDryRunClient(c)
 	}
 	if fo := options.FieldOwner; fo != "" {
@@ -142,12 +150,12 @@ func New(config *rest.Config, options Options) (c Client, err error) {
 		c = WithFieldValidation(c, FieldValidation(fv))
 	}
 
-	return c, err
+	return c
 }
 
-func newClient(config *rest.Config, options Options) (Client, error) {
+func newClient(config *rest.Config, options Options) (*client, Client, error) {
 	if config == nil {
-		return nil, fmt.Errorf("must provide non-nil rest.Config to client.New")
+		return nil, nil, fmt.Errorf("must provide non-nil rest.Config to client.New")
 	}
 
 	config = rest.CopyConfig(config)
@@ -169,7 +177,7 @@ func newClient(config *rest.Config, options Options) (Client, error) {
 		var err error
 		options.HTTPClient, err = rest.HTTPClientFor(config)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -183,7 +191,7 @@ func newClient(config *rest.Config, options Options) (Client, error) {
 		var err error
 		options.Mapper, err = apiutil.NewDynamicRESTMapper(config, options.HTTPClient)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -203,7 +211,7 @@ func newClient(config *rest.Config, options Options) (Client, error) {
 
 	rawMetaClient, err := metadata.NewForConfigAndClient(metadata.ConfigFor(config), options.HTTPClient)
 	if err != nil {
-		return nil, fmt.Errorf("unable to construct metadata-only client for use as part of client: %w", err)
+		return nil, nil, fmt.Errorf("unable to construct metadata-only client for use as part of client: %w", err)
 	}
 
 	c := &client{
@@ -223,7 +231,7 @@ func newClient(config *rest.Config, options Options) (Client, error) {
 		mapper: options.Mapper,
 	}
 	if options.Cache == nil || options.Cache.Reader == nil {
-		return c, nil
+		return c, c, nil
 	}
 
 	// We want a cache if we're here.
@@ -236,21 +244,21 @@ func newClient(config *rest.Config, options Options) (Client, error) {
 	for _, obj := range options.Cache.DisableFor {
 		gvk, err := c.GroupVersionKindFor(obj)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		c.uncachedGVKs[gvk] = struct{}{}
 	}
 
 	if !ptr.Deref(options.Cache.ReadYourOwnWriteConsistencyEnabled, false) {
-		return c, nil
+		return c, c, nil
 	}
 
 	informerCache, isCache := options.Cache.Reader.(cacheapi.Informers)
 	if !isCache {
-		return nil, fmt.Errorf("cache reader does not implement %T, can not provide ReadYourOwnWriteConsistency", cacheapi.Informers(nil))
+		return nil, nil, fmt.Errorf("cache reader does not implement %T, can not provide ReadYourOwnWriteConsistency", cacheapi.Informers(nil))
 	}
 
-	return newConsistentClient(
+	return c, newConsistentClient(
 		c,
 		informerCache,
 		func() writeBarrier { return &keyWriteBarrier{} },
