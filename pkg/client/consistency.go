@@ -59,8 +59,8 @@ func newConsistentClient(
 	return &consistentClient{
 		upstream:  upstream,
 		informers: informers,
-		writeBarriersByGVK: newThreadSafeMap[schema.GroupVersionKind](func() *threadSafeMap[types.NamespacedName, writeBarrier] {
-			return newThreadSafeMap[types.NamespacedName](newWriteBarrier)
+		writeBarriersByGVK: newThreadSafeMap[schema.GroupVersionKind](func() *writeBarriers {
+			return newWriteBarriers(newWriteBarrier)
 		}),
 		consistencyHandlers: newThreadSafeMap[schema.GroupVersionKind](func() *consistencyhandler.ConsistencyHandler {
 			return consistencyhandler.NewHandler(log)
@@ -73,7 +73,7 @@ type consistentClient struct {
 	informers cacheapi.Informers
 
 	// writeBarriersByGVK maps gvk -> key -> writeBarrier
-	writeBarriersByGVK *threadSafeMap[schema.GroupVersionKind, *threadSafeMap[types.NamespacedName, writeBarrier]]
+	writeBarriersByGVK *threadSafeMap[schema.GroupVersionKind, *writeBarriers]
 
 	consistencyHandlers *threadSafeMap[schema.GroupVersionKind, *consistencyhandler.ConsistencyHandler]
 }
@@ -101,9 +101,8 @@ func (c *consistentClient) Get(ctx context.Context, key ObjectKey, obj Object, o
 		return fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
 	}
 
-	barrier := c.writeBarriersByGVK.getOrCreate(gvk).getOrCreate(key)
 	select {
-	case <-barrier.Seal():
+	case <-c.writeBarriersByGVK.getOrCreate(gvk).seal(key):
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -126,12 +125,7 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 	}
 	gvk.Kind = strings.TrimSuffix(gvk.Kind, "List")
 
-	barriers := c.writeBarriersByGVK.getOrCreate(gvk).allValues()
-	sealed := make([]<-chan struct{}, 0, len(barriers))
-	for _, barrier := range barriers {
-		sealed = append(sealed, barrier.Seal())
-	}
-	for _, s := range sealed {
+	for _, s := range c.writeBarriersByGVK.getOrCreate(gvk).sealAll() {
 		select {
 		case <-s:
 		case <-ctx.Done():
@@ -232,7 +226,7 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 		return err
 	}
 
-	release := c.writeBarriersByGVK.getOrCreate(gvk).getOrCreate(namespacedName).Begin()
+	release := c.writeBarriersByGVK.getOrCreate(gvk).Begin(namespacedName)
 	defer release()
 
 	if err := write(); err != nil {
@@ -286,7 +280,7 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 
 	namespacedName := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
 
-	release := c.writeBarriersByGVK.getOrCreate(gvk).getOrCreate(namespacedName).Begin()
+	release := c.writeBarriersByGVK.getOrCreate(gvk).Begin(namespacedName)
 	defer release()
 
 	h, err := c.getConsistencyHandler(ctx, gvk, obj)
@@ -469,13 +463,68 @@ func (t *threadSafeMap[k, v]) getOrCreate(key k) v {
 	return val
 }
 
-func (t *threadSafeMap[k, v]) allValues() []v {
-	t.lock.Lock()
-	defer t.lock.Unlock()
+func newWriteBarriers(newBarrier func() writeBarrier) *writeBarriers {
+	return &writeBarriers{
+		data:       map[types.NamespacedName]*writeBarrierWithRefCounter{},
+		newBarrier: newBarrier,
+	}
+}
 
-	result := make([]v, 0, len(t.data))
-	for _, val := range t.data {
-		result = append(result, val)
+type writeBarrierWithRefCounter struct {
+	writeBarrier
+	inFlightWrites int
+}
+
+// writeBarriers holds one writeBarrier per key that has an in-flight write.
+type writeBarriers struct {
+	lock       sync.Mutex
+	data       map[types.NamespacedName]*writeBarrierWithRefCounter
+	newBarrier func() writeBarrier
+}
+
+func (w *writeBarriers) Begin(key types.NamespacedName) func() {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	barrier, exists := w.data[key]
+	if !exists {
+		barrier = &writeBarrierWithRefCounter{writeBarrier: w.newBarrier()}
+		w.data[key] = barrier
+	}
+	barrier.inFlightWrites++
+	release := barrier.Begin()
+
+	return func() {
+		release()
+
+		w.lock.Lock()
+		defer w.lock.Unlock()
+		barrier.inFlightWrites--
+		if barrier.inFlightWrites == 0 {
+			delete(w.data, key)
+		}
+	}
+}
+
+func (w *writeBarriers) seal(key types.NamespacedName) <-chan struct{} {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	barrier, exists := w.data[key]
+	if !exists {
+		return closedChannel
+	}
+
+	return barrier.Seal()
+}
+
+func (w *writeBarriers) sealAll() []<-chan struct{} {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+
+	result := make([]<-chan struct{}, 0, len(w.data))
+	for _, barrier := range w.data {
+		result = append(result, barrier.Seal())
 	}
 
 	return result
