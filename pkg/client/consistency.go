@@ -280,6 +280,11 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 
 	namespacedName := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
 
+	uid, err := c.uidForDelete(ctx, gvk, namespacedName, obj, opts...)
+	if err != nil {
+		return err
+	}
+
 	release := c.writeBarriersByGVK.getOrCreate(gvk).Begin(namespacedName)
 	defer release()
 
@@ -290,24 +295,45 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 
 	// Register the delete before we execute it, otherwise it may be in the cache
 	// before we register it, causing a deadlock.
-	h.AddPendingDelete(ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, obj.GetUID())
+	h.AddPendingDelete(namespacedName, uid)
 
 	response, err := c.upstream.delete(ctx, obj, opts...)
 	if err != nil {
-		h.RemovePendingDelete(ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, obj.GetUID())
+		h.RemovePendingDelete(namespacedName, uid)
 		return err
 	}
 
 	if rvRaw := response.GetResourceVersion(); rvRaw != "" {
-		h.RemovePendingDelete(ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, obj.GetUID())
+		h.RemovePendingDelete(namespacedName, uid)
 		rv, err := strconv.ParseInt(rvRaw, 10, 64)
 		if err != nil {
 			return fmt.Errorf("failed to parse resource version %s: %w", rvRaw, err)
 		}
-		h.SetMinimumRV(ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}, rv)
+		h.SetMinimumRV(namespacedName, rv)
 	}
 
 	return nil
+}
+
+func (c *consistentClient) uidForDelete(ctx context.Context, gvk schema.GroupVersionKind, key ObjectKey, obj Object, opts ...DeleteOption) (types.UID, error) {
+	deleteOptions := (&DeleteOptions{}).ApplyOptions(opts)
+	if p := deleteOptions.Preconditions; p != nil && ptr.Deref(p.UID, "") != "" {
+		return *p.UID, nil
+	}
+
+	if uid := obj.GetUID(); uid != "" {
+		return uid, nil
+	}
+
+	existing, ok := obj.DeepCopyObject().(Object)
+	if !ok {
+		return "", fmt.Errorf("deepcopy of %T does not implement client.Object", obj)
+	}
+	if err := c.upstream.Get(ctx, key, existing); err != nil {
+		return "", fmt.Errorf("failed to get %s %s to determine its uid: %w", gvk.Kind, key, err)
+	}
+
+	return existing.GetUID(), nil
 }
 
 func (c *consistentClient) DeleteAllOf(ctx context.Context, obj Object, opts ...DeleteAllOfOption) error {

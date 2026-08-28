@@ -161,6 +161,12 @@ func (c *fakeCache) interceptorFuncs() interceptor.Funcs {
 			return nil
 		},
 		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			// The passed object may not have a UID, so fetch the object first to get that
+			beforeDelete := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), beforeDelete); err != nil {
+				return err
+			}
+
 			if err := cl.Delete(ctx, obj, opts...); err != nil {
 				return err
 			}
@@ -172,7 +178,7 @@ func (c *fakeCache) interceptorFuncs() interceptor.Funcs {
 				if !apierrors.IsNotFound(err) {
 					panic(err)
 				}
-				notify(func(h toolscache.ResourceEventHandler) { h.OnDelete(obj) })
+				notify(func(h toolscache.ResourceEventHandler) { h.OnDelete(beforeDelete) })
 				return nil
 			}
 			notify(func(h toolscache.ResourceEventHandler) { h.OnUpdate(nil, result) })
@@ -309,6 +315,19 @@ func TestConsistentFakeClient(t *testing.T) {
 		g.Expect(c.Delete(ctx, deployment())).To(Succeed())
 		return 0
 	}
+	deleteObjectWithoutUID := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		d.SetUID("")
+		g.Expect(c.Delete(ctx, d)).To(Succeed())
+		return 0
+	}
+	deleteObjectWithUIDPrecondition := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		uid := d.GetUID()
+		d.SetUID("")
+		g.Expect(c.Delete(ctx, d, client.Preconditions{UID: &uid})).To(Succeed())
+		return 0
+	}
 	updateStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
 		d := deployment()
 		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d)).To(Succeed())
@@ -346,6 +365,16 @@ func TestConsistentFakeClient(t *testing.T) {
 		g.Expect(c.List(ctx, result)).To(Succeed())
 		g.Expect(result.Items).To(HaveLen(1))
 		g.Expect(resourceVersion(g, result.Items[0].GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
+	}
+	getDeleted := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
+		d := deployment()
+		err := c.Get(ctx, client.ObjectKeyFromObject(d), d)
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected a NotFound error, got %v", err)
+	}
+	listDeleted := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
+		result := &appsv1.DeploymentList{}
+		g.Expect(c.List(ctx, result)).To(Succeed())
+		g.Expect(result.Items).To(BeEmpty())
 	}
 	getTerminating := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
 		result := deployment()
@@ -415,21 +444,37 @@ func TestConsistentFakeClient(t *testing.T) {
 			name:            "Get after Delete",
 			maybeInitObject: deployment,
 			write:           deleteObject,
-			read: func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
-				d := deployment()
-				err := c.Get(ctx, client.ObjectKeyFromObject(d), d)
-				g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected a NotFound error, got %v", err)
-			},
+			read:            getDeleted,
 		},
 		{
 			name:            "List after Delete",
 			maybeInitObject: deployment,
 			write:           deleteObject,
-			read: func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
-				result := &appsv1.DeploymentList{}
-				g.Expect(c.List(ctx, result)).To(Succeed())
-				g.Expect(result.Items).To(BeEmpty())
-			},
+			read:            listDeleted,
+		},
+		{
+			name:            "Get after Delete of an object without uid",
+			maybeInitObject: deployment,
+			write:           deleteObjectWithoutUID,
+			read:            getDeleted,
+		},
+		{
+			name:            "List after Delete of an object without uid",
+			maybeInitObject: deployment,
+			write:           deleteObjectWithoutUID,
+			read:            listDeleted,
+		},
+		{
+			name:            "Get after Delete of an object whose uid is only in the preconditions",
+			maybeInitObject: deployment,
+			write:           deleteObjectWithUIDPrecondition,
+			read:            getDeleted,
+		},
+		{
+			name:            "List after Delete of an object whose uid is only in the preconditions",
+			maybeInitObject: deployment,
+			write:           deleteObjectWithUIDPrecondition,
+			read:            listDeleted,
 		},
 		{
 			name:            "Get after Delete of an object with finalizers",
