@@ -375,6 +375,7 @@ func (c *client) delete(ctx context.Context, obj Object, opts ...DeleteOption) (
 	switch obj.(type) {
 	case runtime.Unstructured:
 		return c.unstructuredClient.Delete(ctx, obj, opts...)
+	// The typed client can also delete PartialObjectMeta
 	default:
 		return c.typedClient.Delete(ctx, obj, opts...)
 	}

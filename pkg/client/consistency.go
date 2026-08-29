@@ -232,16 +232,16 @@ func writeTargetFor(obj any, scheme *runtime.Scheme) (schema.GroupVersionKind, t
 		}
 		cacheObj, err := scheme.New(gvk)
 		if err != nil {
-			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to create cache object for GVK %s: %w", gvk, err)
+			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to create object for GVK %s: %w", gvk, err)
 		}
 		clientObj, ok := cacheObj.(Object)
 		if !ok {
-			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("cache object of type %T for GVK %s does not implement client.Object", cacheObj, gvk)
+			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("object of type %T for GVK %s does not implement client.Object", cacheObj, gvk)
 		}
 		clientObj.SetName(ptr.Deref(t.GetName(), ""))
 		clientObj.SetNamespace(ptr.Deref(t.GetNamespace(), ""))
 		return gvk,
-			types.NamespacedName{Namespace: ptr.Deref(t.GetNamespace(), ""), Name: ptr.Deref(t.GetName(), "")},
+			ObjectKeyFromObject(clientObj),
 			clientObj,
 			func() (string, error) { return resourceVersionFromApplyConfiguration(t) },
 			nil
@@ -269,7 +269,8 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 
 	// We don't technically need an informer since the RV is monotonically increasing, but we want to fail
 	// ASAP if the cache can not be setup.
-	if _, err := c.getConsistencyHandler(ctx, gvk, cacheObj, representation); err != nil {
+	h, err := c.getConsistencyHandler(ctx, gvk, cacheObj, representation)
+	if err != nil {
 		return err
 	}
 
@@ -289,11 +290,7 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 		return fmt.Errorf("failed to parse resource version %s: %w", rvRaw, err)
 	}
 
-	h, err := c.getConsistencyHandler(ctx, gvk, cacheObj, representation)
-	if err != nil {
-		return err
-	}
-	h.SetMinimumRV(ObjectKey{Namespace: cacheObj.GetNamespace(), Name: cacheObj.GetName()}, rv)
+	h.SetMinimumRV(ObjectKeyFromObject(cacheObj), rv)
 
 	return nil
 }
@@ -325,21 +322,20 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 		return fmt.Errorf("failed to get GVK for object %v: %w", obj, err)
 	}
 
-	namespacedName := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
-
-	uid, err := c.uidForDelete(ctx, gvk, namespacedName, obj, opts...)
-	if err != nil {
-		return err
-	}
 	representation := representationIDForObj(obj)
-
-	release := c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).Begin(namespacedName)
-	defer release()
-
 	h, err := c.getConsistencyHandler(ctx, gvk, obj, representation)
 	if err != nil {
 		return err
 	}
+
+	namespacedName := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
+	uid, err := c.uidForDelete(ctx, gvk, namespacedName, obj, opts...)
+	if err != nil {
+		return err
+	}
+
+	release := c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).Begin(namespacedName)
+	defer release()
 
 	// Register the delete before we execute it, otherwise it may be in the cache
 	// before we register it, causing a deadlock.
@@ -351,12 +347,15 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 		return err
 	}
 
+	// Prefer waiting for the RV rather than an actual event since that is likely to be more resilient.
+	// This can only work if the response contains the RV which in turn only happens if the request did
+	// not delete the object from storage, for example because it had a finalizer.
 	if rvRaw := response.GetResourceVersion(); rvRaw != "" {
-		h.RemovePendingDelete(namespacedName, uid)
 		rv, err := strconv.ParseInt(rvRaw, 10, 64)
 		if err != nil {
 			return fmt.Errorf("failed to parse resource version %s: %w", rvRaw, err)
 		}
+		h.RemovePendingDelete(namespacedName, uid)
 		h.SetMinimumRV(namespacedName, rv)
 	}
 

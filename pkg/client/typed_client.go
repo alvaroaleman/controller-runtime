@@ -82,6 +82,7 @@ func (c *typedClient) Delete(ctx context.Context, obj Object, opts ...DeleteOpti
 	deleteOpts := DeleteOptions{}
 	deleteOpts.ApplyOptions(opts)
 
+	// directly deserializing into unstructured fails in the decoder
 	runtimeObj, err := o.Delete().
 		NamespaceIfScoped(o.namespace, o.isNamespaced()).
 		Resource(o.resource()).

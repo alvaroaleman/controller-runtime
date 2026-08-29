@@ -35,9 +35,7 @@ func NewHandler(log logr.Logger) *ConsistencyHandler {
 	return &ConsistencyHandler{
 		rvBroadCaster:             &broadcaster{},
 		pendingDeletesBroadcaster: &broadcaster{},
-		pendingDeletesLock:        sync.RWMutex{},
 		pendingDeletes:            make(map[types.NamespacedName]sets.Set[types.UID]),
-		minimumRVsLock:            sync.Mutex{},
 		minimumRVs:                make(map[types.NamespacedName]int64),
 		log:                       log,
 	}
@@ -52,8 +50,9 @@ type ConsistencyHandler struct {
 	// pendingDeletes holds pending deletes. Must only be accessed when holding pendingDeletesLock
 	pendingDeletes map[types.NamespacedName]sets.Set[types.UID]
 
-	minimumRVsLock sync.Mutex
-	// minimumRVs stores the minimum RVs we must have seen before returning reads.
+	minimumRVsLock sync.RWMutex
+	// minimumRVs stores the minimum RVs we must have seen before returning reads. Must only be
+	// accessed when holding minimumRVsLock.
 	minimumRVs map[types.NamespacedName]int64
 
 	registerLock sync.Mutex
@@ -86,6 +85,7 @@ func (h *ConsistencyHandler) Register(ctx context.Context, informer cacheapi.Inf
 	if err != nil {
 		return fmt.Errorf("failed to add consistency handler to informer: %w", err)
 	}
+	h.registration = &registration
 
 	return h.waitForHandlerSyncLocked(ctx, registration)
 }
@@ -103,20 +103,20 @@ func (h *ConsistencyHandler) waitForHandlerSyncLocked(ctx context.Context, regis
 func (h *ConsistencyHandler) SetMinimumRV(key types.NamespacedName, rv int64) {
 	h.minimumRVsLock.Lock()
 	defer h.minimumRVsLock.Unlock()
-	if rv > h.minimumRVs[key] {
+	if rv > h.minimumRVs[key] && rv > h.observedRV.Load() {
 		h.minimumRVs[key] = rv
 	}
 }
 
 func (h *ConsistencyHandler) getMinimumRVForKey(key types.NamespacedName) int64 {
-	h.minimumRVsLock.Lock()
-	defer h.minimumRVsLock.Unlock()
+	h.minimumRVsLock.RLock()
+	defer h.minimumRVsLock.RUnlock()
 	return h.minimumRVs[key]
 }
 
 func (h *ConsistencyHandler) getMinimumRVForGVK() int64 {
-	h.minimumRVsLock.Lock()
-	defer h.minimumRVsLock.Unlock()
+	h.minimumRVsLock.RLock()
+	defer h.minimumRVsLock.RUnlock()
 	var maxRV int64
 	for _, rv := range h.minimumRVs {
 		if rv > maxRV {
@@ -161,38 +161,33 @@ func (h *ConsistencyHandler) RemovePendingDelete(key types.NamespacedName, uid t
 }
 
 func (h *ConsistencyHandler) WaitForList(ctx context.Context) error {
-	if err := h.waitForRV(ctx, h.getMinimumRVForGVK()); err != nil {
-		return err
-	}
-
-	return h.waitAllDeletes(ctx)
-}
-
-func (h *ConsistencyHandler) WaitForGet(ctx context.Context, key types.NamespacedName) error {
-	if err := h.waitForRV(ctx, h.getMinimumRVForKey(key)); err != nil {
-		return err
-	}
-
-	return h.waitDeletesForKey(ctx, key)
-}
-
-// waitDeletesForKey blocks until all pending deletes at the time of calling it were observed or context times out
-func (h *ConsistencyHandler) waitDeletesForKey(ctx context.Context, key types.NamespacedName) error {
-	h.pendingDeletesLock.RLock()
-	pendingDeletes := maps.Clone(h.pendingDeletes[key])
-	h.pendingDeletesLock.RUnlock()
-
-	return h.waitDeletes(ctx, pendingDeletes)
-}
-
-// waitDeletesForGVK blocks until all pending deletes at the time of calling it were observed or context times out
-func (h *ConsistencyHandler) waitAllDeletes(ctx context.Context) error {
+	// snapshot deletes before waiting for the RV so we don't end up including
+	// deletes that came in while we waited.
 	h.pendingDeletesLock.RLock()
 	pendingDeletes := sets.Set[types.UID]{}
 	for _, uids := range h.pendingDeletes {
 		maps.Copy(pendingDeletes, uids)
 	}
 	h.pendingDeletesLock.RUnlock()
+
+	if err := h.waitForRV(ctx, h.getMinimumRVForGVK()); err != nil {
+		return err
+	}
+
+	return h.waitDeletes(ctx, pendingDeletes)
+}
+
+func (h *ConsistencyHandler) WaitForGet(ctx context.Context, key types.NamespacedName) error {
+	// snapshot deletes before waiting for the RV so we don't end up including
+	// deletes that came in while we waited.
+	h.pendingDeletesLock.RLock()
+	pendingDeletes := maps.Clone(h.pendingDeletes[key])
+	h.pendingDeletesLock.RUnlock()
+
+	rv := h.getMinimumRVForKey(key)
+	if err := h.waitForRV(ctx, rv); err != nil {
+		return err
+	}
 
 	return h.waitDeletes(ctx, pendingDeletes)
 }
@@ -206,9 +201,7 @@ func (h *ConsistencyHandler) waitDeletes(ctx context.Context, uids sets.Set[type
 		// must store the chan before checking the deletes to guarantee that even if the deletes
 		// get  updated after our check and before the select, we still get an event.
 		updatedChan := h.pendingDeletesBroadcaster.wait()
-		h.pendingDeletesLock.RLock()
-		done := h.allDeletedLocked(uids)
-		h.pendingDeletesLock.RUnlock()
+		done := h.allDeleted(uids)
 		if done {
 			return nil
 		}
@@ -217,12 +210,15 @@ func (h *ConsistencyHandler) waitDeletes(ctx context.Context, uids sets.Set[type
 		case <-updatedChan:
 			continue
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("failed waiting to observe deletes for uids %v: %w", sets.List(uids), ctx.Err())
 		}
 	}
 }
 
-func (h *ConsistencyHandler) allDeletedLocked(uids sets.Set[types.UID]) bool {
+func (h *ConsistencyHandler) allDeleted(uids sets.Set[types.UID]) bool {
+	h.pendingDeletesLock.RLock()
+	defer h.pendingDeletesLock.RUnlock()
+
 	for wantDeleted := range uids {
 		for _, notDeletedUIDs := range h.pendingDeletes {
 			if notDeletedUIDs.Has(wantDeleted) {
@@ -235,17 +231,7 @@ func (h *ConsistencyHandler) allDeletedLocked(uids sets.Set[types.UID]) bool {
 }
 
 func (h *ConsistencyHandler) observeDeletion(obj cacheapi.Object) {
-	key := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
-	h.pendingDeletesLock.Lock()
-	defer h.pendingDeletesLock.Unlock()
-
-	if h.pendingDeletes[key].Has(obj.GetUID()) {
-		h.pendingDeletes[key].Delete(obj.GetUID())
-		h.pendingDeletesBroadcaster.broadcast()
-	}
-	if len(h.pendingDeletes[key]) == 0 {
-		delete(h.pendingDeletes, key)
-	}
+	h.RemovePendingDelete(types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}, obj.GetUID())
 }
 
 func (h *ConsistencyHandler) waitForRV(ctx context.Context, rv int64) error {
@@ -260,7 +246,7 @@ func (h *ConsistencyHandler) waitForRV(ctx context.Context, rv int64) error {
 		case <-updatedChan:
 			continue
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("failed waiting for resource version %d to be observed: %w", rv, ctx.Err())
 		}
 	}
 }
@@ -314,7 +300,7 @@ func (h *ConsistencyHandler) OnDelete(raw any) {
 	case cache.DeletedFinalStateUnknown:
 		obj = t.Obj.(cacheapi.Object)
 	default:
-		h.log.Error(nil, "OnDelete received object that is not a cacheapi.Object or DeletedFinalStateUnknown", "object", raw)
+		h.log.Error(nil, "OnDelete received object that is not a cacheapi.Object or toolscache.DeletedFinalStateUnknown", "object", raw)
 		return
 	}
 	go func() { h.observeResourceVersion(obj.GetResourceVersion()) }()
