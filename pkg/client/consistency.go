@@ -27,6 +27,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -55,10 +56,10 @@ func newConsistentClient(
 	return &consistentClient{
 		upstream:  upstream,
 		informers: informers,
-		writeBarriersByGVK: newThreadSafeMap[schema.GroupVersionKind](func() writebarrier.WriteBarriers {
+		writeBarriers: newThreadSafeMap[gvkAndRepresentation](func() writebarrier.WriteBarriers {
 			return writebarrier.NewWriteBarriers(newWriteBarrier)
 		}),
-		consistencyHandlers: newThreadSafeMap[schema.GroupVersionKind](func() *consistencyhandler.ConsistencyHandler {
+		consistencyHandlers: newThreadSafeMap[gvkAndRepresentation](func() *consistencyhandler.ConsistencyHandler {
 			return consistencyhandler.NewHandler(log)
 		}),
 	}
@@ -68,14 +69,42 @@ type consistentClient struct {
 	upstream  consistentClientUpstream
 	informers cacheapi.Informers
 
-	// writeBarriersByGVK maps gvk -> key -> writeBarrier
-	writeBarriersByGVK *threadSafeMap[schema.GroupVersionKind, writebarrier.WriteBarriers]
+	writeBarriers *threadSafeMap[gvkAndRepresentation, writebarrier.WriteBarriers]
 
-	consistencyHandlers *threadSafeMap[schema.GroupVersionKind, *consistencyhandler.ConsistencyHandler]
+	consistencyHandlers *threadSafeMap[gvkAndRepresentation, *consistencyhandler.ConsistencyHandler]
 }
 
-func (c *consistentClient) getConsistencyHandler(ctx context.Context, gvk schema.GroupVersionKind, obj cacheapi.Object) (*consistencyhandler.ConsistencyHandler, error) {
-	h := c.consistencyHandlers.getOrCreate(gvk)
+type gvkAndRepresentation struct {
+	gvk            schema.GroupVersionKind
+	representation representationID
+}
+
+func representationIDForObj(obj any) representationID {
+	switch obj.(type) {
+	case *unstructured.Unstructured, *unstructured.UnstructuredList:
+		return representationIDUnstructured
+	case *metav1.PartialObjectMetadata, *metav1.PartialObjectMetadataList:
+		return representationIDPartialObjectMetadata
+	default:
+		return representationIDTyped
+	}
+}
+
+type representationID int8
+
+const (
+	representationIDUnstructured representationID = iota
+	representationIDPartialObjectMetadata
+	representationIDTyped
+)
+
+func (c *consistentClient) getConsistencyHandler(
+	ctx context.Context,
+	gvk schema.GroupVersionKind,
+	obj Object,
+	representation representationID,
+) (*consistencyhandler.ConsistencyHandler, error) {
+	h := c.consistencyHandlers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation})
 	if h.Registered() {
 		return h, nil
 	}
@@ -96,19 +125,20 @@ func (c *consistentClient) Get(ctx context.Context, key ObjectKey, obj Object, o
 	if err != nil {
 		return fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
 	}
+	representation := representationIDForObj(obj)
 
 	select {
-	case <-c.writeBarriersByGVK.getOrCreate(gvk).Seal(key):
+	case <-c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).Seal(key):
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 
-	h, err := c.getConsistencyHandler(ctx, gvk, obj)
+	h, err := c.getConsistencyHandler(ctx, gvk, obj, representation)
 	if err != nil {
 		return err
 	}
 	if err := h.WaitForGet(ctx, key); err != nil {
-		return err
+		return fmt.Errorf("failed to wait for cache to catch up: %w", err)
 	}
 
 	return c.upstream.Get(ctx, key, obj, opts...)
@@ -120,8 +150,9 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 		return fmt.Errorf("failed to get GVK for list %T: %w", list, err)
 	}
 	gvk.Kind = strings.TrimSuffix(gvk.Kind, "List")
+	representation := representationIDForObj(list)
 
-	for _, s := range c.writeBarriersByGVK.getOrCreate(gvk).SealAll() {
+	for _, s := range c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).SealAll() {
 		select {
 		case <-s:
 		case <-ctx.Done():
@@ -129,21 +160,34 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 		}
 	}
 
-	listObj, err := c.upstream.Scheme().New(gvk)
-	if err != nil {
-		return fmt.Errorf("failed to create object for GVK %s: %w", gvk, err)
-	}
-	cacheObj, ok := listObj.(cacheapi.Object)
-	if !ok {
-		return fmt.Errorf("object of type %T for GVK %s does not implement cacheapi.Object", listObj, gvk)
+	var obj Object
+	switch representation {
+	case representationIDUnstructured:
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvk)
+		obj = u
+	case representationIDPartialObjectMetadata:
+		m := &metav1.PartialObjectMetadata{}
+		m.SetGroupVersionKind(gvk)
+		obj = m
+	case representationIDTyped:
+		raw, err := c.upstream.Scheme().New(gvk)
+		if err != nil {
+			return fmt.Errorf("failed to create object for GVK %s: %w", gvk, err)
+		}
+		asserted, ok := raw.(Object)
+		if !ok {
+			return fmt.Errorf("object of type %T for GVK %s does not implement Object", raw, gvk)
+		}
+		obj = asserted
 	}
 
-	h, err := c.getConsistencyHandler(ctx, gvk, cacheObj)
+	h, err := c.getConsistencyHandler(ctx, gvk, obj, representation)
 	if err != nil {
 		return err
 	}
 	if err := h.WaitForList(ctx); err != nil {
-		return err
+		return fmt.Errorf("failed to wait for cache to catch up: %w", err)
 	}
 
 	return c.upstream.List(ctx, list, opts...)
@@ -221,14 +265,15 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 	if err != nil {
 		return err
 	}
+	representation := representationIDForObj(cacheObj)
 
 	// We don't technically need an informer since the RV is monotonically increasing, but we want to fail
 	// ASAP if the cache can not be setup.
-	if _, err := c.getConsistencyHandler(ctx, gvk, cacheObj); err != nil {
+	if _, err := c.getConsistencyHandler(ctx, gvk, cacheObj, representation); err != nil {
 		return err
 	}
 
-	release := c.writeBarriersByGVK.getOrCreate(gvk).Begin(namespacedName)
+	release := c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).Begin(namespacedName)
 	defer release()
 
 	if err := write(); err != nil {
@@ -244,7 +289,7 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 		return fmt.Errorf("failed to parse resource version %s: %w", rvRaw, err)
 	}
 
-	h, err := c.getConsistencyHandler(ctx, gvk, cacheObj)
+	h, err := c.getConsistencyHandler(ctx, gvk, cacheObj, representation)
 	if err != nil {
 		return err
 	}
@@ -286,11 +331,12 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 	if err != nil {
 		return err
 	}
+	representation := representationIDForObj(obj)
 
-	release := c.writeBarriersByGVK.getOrCreate(gvk).Begin(namespacedName)
+	release := c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).Begin(namespacedName)
 	defer release()
 
-	h, err := c.getConsistencyHandler(ctx, gvk, obj)
+	h, err := c.getConsistencyHandler(ctx, gvk, obj, representation)
 	if err != nil {
 		return err
 	}
