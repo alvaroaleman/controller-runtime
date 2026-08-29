@@ -22,12 +22,20 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// WriteBarriers adds garbage collection for unused keys to WriteBarrier.
 type WriteBarriers interface {
-	Begin(key types.NamespacedName) func()
+	// Begin keeps the passed key locked until the returned release func was called.
+	Begin(key types.NamespacedName) (release func())
+
+	// Seal seals the currently-active set of locks to key and returns a channel that
+	// closes when they are done.
 	Seal(key types.NamespacedName) <-chan struct{}
+
+	// SealAll is Seal for all keys.
 	SealAll() []<-chan struct{}
 }
 
+// NewWriteBarriers construct WriteBarrierrs. newBarrier is configurable for testing purposes only.
 func NewWriteBarriers(newBarrier func() WriteBarrier) WriteBarriers {
 	return &writeBarriers{
 		data:       map[types.NamespacedName]*writeBarrierWithRefCounter{},
@@ -103,7 +111,7 @@ func init() {
 }
 
 type writeBatch struct {
-	barrier  *KeyWriteBarrier
+	barrier  *keyWriteBarrier
 	inFlight int
 	done     chan struct{}
 }
@@ -128,15 +136,26 @@ type WriteBarrier interface {
 	Seal() <-chan struct{}
 }
 
-// KeyWriteBarrier allows to wait for a set of in-flight writes to finish.
-type KeyWriteBarrier struct {
+// NewWriteBarrier creates a new WriteBarrier
+func NewWriteBarrier() WriteBarrier {
+	return &keyWriteBarrier{previous: closedChannel}
+}
+
+// keyWriteBarrier allows to wait for a set of in-flight writes to finish.
+type keyWriteBarrier struct {
 	// mutex must be held to access current
-	mutex   sync.Mutex
+	mutex sync.Mutex
+
+	// current is the current write batch. It has a reference to the key write
+	// barrier that it uses to delete itself once done.
 	current *writeBatch
+
+	// previous is closed once all previous write batches are done.
+	previous <-chan struct{}
 }
 
 // Begin adds a write to the current batch, starting one if needed.
-func (b *KeyWriteBarrier) Begin() func() {
+func (b *keyWriteBarrier) Begin() func() {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
@@ -148,17 +167,27 @@ func (b *KeyWriteBarrier) Begin() func() {
 	return b.current.release
 }
 
-// Seal seals the current write batch and returns a channel that closes
-// once all writes in the batch are done.
-func (b *KeyWriteBarrier) Seal() <-chan struct{} {
+func (b *keyWriteBarrier) Seal() <-chan struct{} {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
 	if b.current == nil {
-		return closedChannel
+		return b.previous
 	}
 
-	done := b.current.done
+	done := make(chan struct{})
+	current := b.current.done
 	b.current = nil
+
+	previous := b.previous
+	b.previous = done
+
+	go func() {
+		for _, c := range []<-chan struct{}{previous, current} {
+			<-c
+		}
+		close(done)
+	}()
+
 	return done
 }

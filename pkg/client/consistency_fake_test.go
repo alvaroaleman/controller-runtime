@@ -248,12 +248,12 @@ func (fakeDoneChecker) Done() <-chan struct{} {
 }
 
 type keyWriteBarrierWithBeginCallback struct {
-	writebarrier.KeyWriteBarrier
+	writebarrier.WriteBarrier
 	beginCallback func()
 }
 
 func (k *keyWriteBarrierWithBeginCallback) Begin() func() {
-	release := k.KeyWriteBarrier.Begin()
+	release := k.WriteBarrier.Begin()
 	k.beginCallback()
 	return release
 }
@@ -544,7 +544,7 @@ func TestConsistentFakeClient(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
 				g := NewWithT(t)
-				barrier := keyWriteBarrierWithBeginCallback{}
+				barrier := keyWriteBarrierWithBeginCallback{WriteBarrier: writebarrier.NewWriteBarrier()}
 
 				var initObjects []client.Object
 				if tc.maybeInitObject != nil {

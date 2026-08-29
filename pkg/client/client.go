@@ -262,7 +262,7 @@ func newClient(config *rest.Config, options Options) (*client, Client, error) {
 	return c, newConsistentClient(
 		c,
 		informerCache,
-		func() writebarrier.WriteBarrier { return &writebarrier.KeyWriteBarrier{} },
+		writebarrier.NewWriteBarrier,
 		options.Log,
 	), nil
 }
