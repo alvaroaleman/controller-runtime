@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -239,6 +240,7 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 		return err
 	}
 
+	time.Sleep(5 * time.Second)
 	rvRaw, err := getResourceVersion()
 	if err != nil {
 		return fmt.Errorf("failed to get resource version from %T: %w", obj, err)
@@ -436,9 +438,15 @@ func (w *writeBatch) release() {
 
 // keyWriteBarrier allows to wait for a set of in-flight writes to finish.
 type keyWriteBarrier struct {
-	// mutex must be held to access current
-	mutex   sync.Mutex
+	// mutex must be held to access current or previous
+	mutex sync.Mutex
+
+	// current is the current write batch. It has a reference to the key write
+	// barrier that it uses to delete itself once done.
 	current *writeBatch
+
+	// previous is closed once all previous write batches are done.
+	previous <-chan struct{}
 }
 
 // Begin adds a write to the current batch, starting one if needed.
@@ -455,17 +463,33 @@ func (b *keyWriteBarrier) Begin() func() {
 }
 
 // Seal seals the current write batch and returns a channel that closes
-// once all writes in the batch are done.
+// once all writes in the current batch as well as all previous batches
+// are done.
 func (b *keyWriteBarrier) Seal() <-chan struct{} {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
 	if b.current == nil {
-		return closedChannel
+		println("Returning previous")
+		return b.previous
 	}
 
-	done := b.current.done
+	done := make(chan struct{})
+	previous := b.previous
+	b.previous = closedChannel
+	current := b.current.done
 	b.current = nil
+
+	println("Setting previous")
+	go func() {
+		for idx, c := range []<-chan struct{}{previous, current} {
+			start := time.Now()
+			<-c
+			fmt.Printf("Waited %s for %d\n", time.Since(start), idx)
+		}
+		close(done)
+	}()
+
 	return done
 }
 
@@ -508,6 +532,9 @@ type writeBarrierWithRefCounter struct {
 }
 
 // writeBarriers holds one writeBarrier per key that has an in-flight write.
+// The reason for it to exist over a generic map is is to perform garbage
+// collection so we don't hold on a map entyr per unique key that was ever
+// observed.
 type writeBarriers struct {
 	lock       sync.Mutex
 	data       map[types.NamespacedName]*writeBarrierWithRefCounter
@@ -520,10 +547,12 @@ func (w *writeBarriers) Begin(key types.NamespacedName) func() {
 
 	barrier, exists := w.data[key]
 	if !exists {
+		fmt.Printf("Creating kv barrier for %s\n", key)
 		barrier = &writeBarrierWithRefCounter{writeBarrier: w.newBarrier()}
 		w.data[key] = barrier
 	}
 	barrier.inFlightWrites++
+	fmt.Printf("Begin kv barrier for %s\n", key)
 	release := barrier.Begin()
 
 	return func() {
@@ -532,9 +561,9 @@ func (w *writeBarriers) Begin(key types.NamespacedName) func() {
 		w.lock.Lock()
 		defer w.lock.Unlock()
 		barrier.inFlightWrites--
-		if barrier.inFlightWrites == 0 {
-			delete(w.data, key)
-		}
+		// if barrier.inFlightWrites == 0 {
+		// 	delete(w.data, key)
+		// }
 	}
 }
 
@@ -544,6 +573,7 @@ func (w *writeBarriers) seal(key types.NamespacedName) <-chan struct{} {
 
 	barrier, exists := w.data[key]
 	if !exists {
+		fmt.Printf("does not exist for %s, returning closed chan\n", key)
 		return closedChannel
 	}
 

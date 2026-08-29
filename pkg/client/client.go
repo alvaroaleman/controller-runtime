@@ -261,7 +261,7 @@ func newClient(config *rest.Config, options Options) (*client, Client, error) {
 	return c, newConsistentClient(
 		c,
 		informerCache,
-		func() writeBarrier { return &keyWriteBarrier{} },
+		func() writeBarrier { return &keyWriteBarrier{previous: closedChannel} },
 		options.Log,
 	), nil
 }

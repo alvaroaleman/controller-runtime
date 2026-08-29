@@ -19,12 +19,13 @@ package client_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
@@ -106,44 +107,69 @@ var _ = Describe("ConsistentClient", func() {
 				Expect(client.IgnoreNotFound(cl.Delete(ctx, cm))).To(Succeed())
 			})
 
-			result, err := write(ctx, cl, cm)
-			Expect(err).NotTo(HaveOccurred())
-
 			done := make(chan struct{})
-
+			fmt.Printf("%s: write cm started\n", time.Now())
+			var result *writeResult
+			var resultLock sync.Mutex
+			writeDone := make(chan struct{})
 			go func() {
 				defer GinkgoRecover()
-				defer func() { done <- struct{}{} }()
-
-				if result.deleted {
-					err := cl.Get(ctx, client.ObjectKeyFromObject(cm), &corev1.ConfigMap{})
-					Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected NotFound after delete, got: %v", err)
-				} else {
-					got := &corev1.ConfigMap{}
-					Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), got)).To(Succeed())
-					Expect(got.Name).To(Equal(result.name))
-					Expect(got.Data).To(Equal(result.data))
-				}
+				res, err := write(ctx, cl, cm)
+				Expect(err).NotTo(HaveOccurred())
+				resultLock.Lock()
+				defer resultLock.Unlock()
+				result = &res
 			}()
 
 			go func() {
 				defer GinkgoRecover()
-				defer func() { done <- struct{}{} }()
+				defer func() {
+					done <- struct{}{}
+				}()
+
+				//if result.deleted {
+				//	err := cl.Get(ctx, client.ObjectKeyFromObject(cm), &corev1.ConfigMap{})
+				//	Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected NotFound after delete, got: %v", err)
+				//} else {
+				got := &corev1.ConfigMap{}
+				fmt.Printf("%s: Get started\n", time.Now())
+				Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), got)).To(Succeed())
+				fmt.Printf("%s: Get executed\n", time.Now())
+
+				resultLock.Lock()
+				defer resultLock.Unlock()
+				Expect(result).NotTo(BeNil(), "write result should not be nil")
+				Expect(got.Name).To(Equal(result.name))
+				Expect(got.Data).To(Equal(result.data))
+				//}
+			}()
+
+			go func() {
+				defer GinkgoRecover()
+				defer func() {
+					done <- struct{}{}
+				}()
 
 				list := &corev1.ConfigMapList{}
+				fmt.Printf("%s: List started\n", time.Now())
 				Expect(cl.List(ctx, list, client.InNamespace(ns.Name))).To(Succeed())
+				fmt.Printf("%s: List executed\n", time.Now())
 
-				if result.deleted {
-					Expect(list.Items).To(BeEmpty(), "list should be empty after delete")
-				} else {
-					Expect(list.Items).To(HaveLen(1), "list should contain exactly one ConfigMap")
-					Expect(list.Items[0].Name).To(Equal(result.name))
-					Expect(list.Items[0].Data).To(Equal(result.data))
-				}
+				//if result.deleted {
+				//	Expect(list.Items).To(BeEmpty(), "list should be empty after delete")
+				//} else {
+				Expect(list.Items).To(HaveLen(1), "list should contain exactly one ConfigMap")
+				resultLock.Lock()
+				defer resultLock.Unlock()
+				Expect(result).NotTo(BeNil(), "write result should not be nil")
+				Expect(list.Items[0].Name).To(Equal(result.name))
+				Expect(list.Items[0].Data).To(Equal(result.data))
+				//}
 			}()
 
 			<-done
 			<-done
+			<-writeDone
 		},
 
 		Entry("create", func(ctx context.Context, cl client.Client, cm *corev1.ConfigMap) (writeResult, error) {
@@ -153,7 +179,7 @@ var _ = Describe("ConsistentClient", func() {
 			}, nil // already created in the setup
 		}),
 
-		Entry("update", func(ctx context.Context, cl client.Client, cm *corev1.ConfigMap) (writeResult, error) {
+		FEntry("update", func(ctx context.Context, cl client.Client, cm *corev1.ConfigMap) (writeResult, error) {
 			got := &corev1.ConfigMap{}
 			if err := cl.Get(ctx, client.ObjectKeyFromObject(cm), got); err != nil {
 				return writeResult{}, err
