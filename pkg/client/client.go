@@ -37,6 +37,7 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/client/internal/writebarrier"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -261,7 +262,7 @@ func newClient(config *rest.Config, options Options) (*client, Client, error) {
 	return c, newConsistentClient(
 		c,
 		informerCache,
-		func() writeBarrier { return &keyWriteBarrier{} },
+		func() writebarrier.WriteBarrier { return &writebarrier.KeyWriteBarrier{} },
 		options.Log,
 	), nil
 }

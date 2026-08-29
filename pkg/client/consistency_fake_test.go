@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/client/internal/writebarrier"
 )
 
 // watchDelay is how long the fake cache lags behind the fake client.
@@ -49,7 +50,7 @@ const watchDelay = 10 * time.Second
 // and a fake cache that delivers events with a 10 second delay.
 func newConsistentFakeClient(
 	t *testing.T,
-	barrier client.WriteBarrier,
+	barrier writebarrier.WriteBarrier,
 	initObjects ...client.Object,
 ) client.Client {
 	t.Helper()
@@ -64,7 +65,7 @@ func newConsistentFakeClient(
 	return client.NewConsistentClient(
 		&fakeConsistentClientUpstream{Client: upstream},
 		fc,
-		func() client.WriteBarrier { return barrier },
+		func() writebarrier.WriteBarrier { return barrier },
 	)
 }
 
@@ -247,7 +248,7 @@ func (fakeDoneChecker) Done() <-chan struct{} {
 }
 
 type keyWriteBarrierWithBeginCallback struct {
-	client.KeyWriteBarrier
+	writebarrier.KeyWriteBarrier
 	beginCallback func()
 }
 

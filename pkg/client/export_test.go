@@ -22,19 +22,13 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
+	"sigs.k8s.io/controller-runtime/pkg/client/internal/writebarrier"
 )
 
 // The purpose of this file is purely to export a few private identifiers from package
 // client into package client_test. This is needed because the consistent client tests
 // must be in package client_test to avoid an import cycle, since they import the fake
 // client and the interceptor, both of which import pkg/client.
-
-type (
-	// WriteBarrier is the per key write barrier reads in the consistent client wait on.
-	WriteBarrier = writeBarrier
-	// KeyWriteBarrier is the implementation of WriteBarrier the client uses
-	KeyWriteBarrier = keyWriteBarrier
-)
 
 // UpstreamClient is what NewConsistentClient wraps. It mirrors the unexported
 // upstreamClient interface, but with an exported delete so that it can be
@@ -54,6 +48,10 @@ func (u upstreamClientShim) delete(ctx context.Context, obj Object, opts ...Dele
 }
 
 // NewConsistentClient constructs a consistent client on top of an arbitrary upstream.
-func NewConsistentClient(upstream UpstreamClient, informers cacheapi.Informers, newWriteBarrier func() WriteBarrier) Client {
+func NewConsistentClient(
+	upstream UpstreamClient,
+	informers cacheapi.Informers,
+	newWriteBarrier func() writebarrier.WriteBarrier,
+) Client {
 	return newConsistentClient(upstreamClientShim{upstream}, informers, newWriteBarrier, logr.Discard())
 }

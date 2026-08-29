@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/internal/consistencyhandler"
+	"sigs.k8s.io/controller-runtime/pkg/client/internal/writebarrier"
 )
 
 type consistentClientUpstream interface {
@@ -43,24 +44,19 @@ type consistentClientUpstream interface {
 	delete(ctx context.Context, obj Object, opts ...DeleteOption) (*unstructured.Unstructured, error)
 }
 
-type writeBarrier interface {
-	Begin() (release func())
-	Seal() <-chan struct{}
-}
-
 var _ Client = (*consistentClient)(nil)
 
 func newConsistentClient(
 	upstream consistentClientUpstream,
 	informers cacheapi.Informers,
-	newWriteBarrier func() writeBarrier,
+	newWriteBarrier func() writebarrier.WriteBarrier,
 	log logr.Logger,
 ) *consistentClient {
 	return &consistentClient{
 		upstream:  upstream,
 		informers: informers,
-		writeBarriersByGVK: newThreadSafeMap[schema.GroupVersionKind](func() *writeBarriers {
-			return newWriteBarriers(newWriteBarrier)
+		writeBarriersByGVK: newThreadSafeMap[schema.GroupVersionKind](func() writebarrier.WriteBarriers {
+			return writebarrier.NewWriteBarriers(newWriteBarrier)
 		}),
 		consistencyHandlers: newThreadSafeMap[schema.GroupVersionKind](func() *consistencyhandler.ConsistencyHandler {
 			return consistencyhandler.NewHandler(log)
@@ -73,7 +69,7 @@ type consistentClient struct {
 	informers cacheapi.Informers
 
 	// writeBarriersByGVK maps gvk -> key -> writeBarrier
-	writeBarriersByGVK *threadSafeMap[schema.GroupVersionKind, *writeBarriers]
+	writeBarriersByGVK *threadSafeMap[schema.GroupVersionKind, writebarrier.WriteBarriers]
 
 	consistencyHandlers *threadSafeMap[schema.GroupVersionKind, *consistencyhandler.ConsistencyHandler]
 }
@@ -102,7 +98,7 @@ func (c *consistentClient) Get(ctx context.Context, key ObjectKey, obj Object, o
 	}
 
 	select {
-	case <-c.writeBarriersByGVK.getOrCreate(gvk).seal(key):
+	case <-c.writeBarriersByGVK.getOrCreate(gvk).Seal(key):
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -125,7 +121,7 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 	}
 	gvk.Kind = strings.TrimSuffix(gvk.Kind, "List")
 
-	for _, s := range c.writeBarriersByGVK.getOrCreate(gvk).sealAll() {
+	for _, s := range c.writeBarriersByGVK.getOrCreate(gvk).SealAll() {
 		select {
 		case <-s:
 		case <-ctx.Done():
@@ -406,69 +402,6 @@ func (c *consistentSubResourceClient) Apply(ctx context.Context, obj runtime.App
 	})
 }
 
-var closedChannel chan struct{}
-
-func init() {
-	closedChannel = make(chan struct{})
-	close(closedChannel)
-}
-
-type writeBatch struct {
-	barrier  *keyWriteBarrier
-	inFlight int
-	done     chan struct{}
-}
-
-func (w *writeBatch) release() {
-	w.barrier.mutex.Lock()
-	defer w.barrier.mutex.Unlock()
-
-	w.inFlight--
-	if w.inFlight > 0 {
-		return
-	}
-
-	close(w.done)
-	if w.barrier.current == w {
-		w.barrier.current = nil
-	}
-}
-
-// keyWriteBarrier allows to wait for a set of in-flight writes to finish.
-type keyWriteBarrier struct {
-	// mutex must be held to access current
-	mutex   sync.Mutex
-	current *writeBatch
-}
-
-// Begin adds a write to the current batch, starting one if needed.
-func (b *keyWriteBarrier) Begin() func() {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-
-	if b.current == nil {
-		b.current = &writeBatch{barrier: b, done: make(chan struct{})}
-	}
-	b.current.inFlight++
-
-	return b.current.release
-}
-
-// Seal seals the current write batch and returns a channel that closes
-// once all writes in the batch are done.
-func (b *keyWriteBarrier) Seal() <-chan struct{} {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-
-	if b.current == nil {
-		return closedChannel
-	}
-
-	done := b.current.done
-	b.current = nil
-	return done
-}
-
 func newThreadSafeMap[k comparable, v any](newValue func() v) *threadSafeMap[k, v] {
 	return &threadSafeMap[k, v]{
 		data:     map[k]v{},
@@ -493,71 +426,4 @@ func (t *threadSafeMap[k, v]) getOrCreate(key k) v {
 	}
 
 	return val
-}
-
-func newWriteBarriers(newBarrier func() writeBarrier) *writeBarriers {
-	return &writeBarriers{
-		data:       map[types.NamespacedName]*writeBarrierWithRefCounter{},
-		newBarrier: newBarrier,
-	}
-}
-
-type writeBarrierWithRefCounter struct {
-	writeBarrier
-	inFlightWrites int
-}
-
-// writeBarriers holds one writeBarrier per key that has an in-flight write.
-type writeBarriers struct {
-	lock       sync.Mutex
-	data       map[types.NamespacedName]*writeBarrierWithRefCounter
-	newBarrier func() writeBarrier
-}
-
-func (w *writeBarriers) Begin(key types.NamespacedName) func() {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-
-	barrier, exists := w.data[key]
-	if !exists {
-		barrier = &writeBarrierWithRefCounter{writeBarrier: w.newBarrier()}
-		w.data[key] = barrier
-	}
-	barrier.inFlightWrites++
-	release := barrier.Begin()
-
-	return func() {
-		release()
-
-		w.lock.Lock()
-		defer w.lock.Unlock()
-		barrier.inFlightWrites--
-		if barrier.inFlightWrites == 0 {
-			delete(w.data, key)
-		}
-	}
-}
-
-func (w *writeBarriers) seal(key types.NamespacedName) <-chan struct{} {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-
-	barrier, exists := w.data[key]
-	if !exists {
-		return closedChannel
-	}
-
-	return barrier.Seal()
-}
-
-func (w *writeBarriers) sealAll() []<-chan struct{} {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-
-	result := make([]<-chan struct{}, 0, len(w.data))
-	for _, barrier := range w.data {
-		result = append(result, barrier.Seal())
-	}
-
-	return result
 }
