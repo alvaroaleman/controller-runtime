@@ -43,6 +43,327 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/internal/writebarrier"
 )
 
+// TestConsistentFakeClient uses a callback on the start of a write operation
+// to start a read operation, then validates the read operation observes the write.
+// It uses a fake cache with a fixed ten seconds delay in synctest, to avoid having to
+// wait ten seconds of wallclock time.
+//
+// It tests the cross product of all write operations and get and list.
+func TestConsistentFakeClient(t *testing.T) {
+	t.Parallel()
+
+	const namespace = "default"
+
+	deployment := func() *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: namespace, UID: "test-uid"},
+		}
+	}
+
+	deploymentWithFinalizer := func() *appsv1.Deployment {
+		d := deployment()
+		d.SetFinalizers([]string{"test.io/finalizer"})
+		return d
+	}
+
+	resourceVersion := func(g *WithT, rv string) int64 {
+		parsed, err := strconv.ParseInt(rv, 10, 64)
+		g.Expect(err).NotTo(HaveOccurred(), "failed to parse resource version %q", rv)
+		return parsed
+	}
+
+	create := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		g.Expect(c.Create(ctx, d)).To(Succeed())
+		return resourceVersion(g, d.GetResourceVersion())
+	}
+	update := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d)).To(Succeed())
+		d.SetLabels(map[string]string{"updated": "true"})
+		g.Expect(c.Update(ctx, d)).To(Succeed())
+		return resourceVersion(g, d.GetResourceVersion())
+	}
+	patch := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		patch := client.MergeFrom(d.DeepCopyObject().(client.Object))
+		d.SetLabels(map[string]string{"patched": "true"})
+		g.Expect(c.Patch(ctx, d, patch)).To(Succeed())
+		return resourceVersion(g, d.GetResourceVersion())
+	}
+	apply := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		ac := appsv1applyconfigurations.Deployment(deployment().GetName(), namespace).
+			WithLabels(map[string]string{"applied": "true"})
+		g.Expect(c.Apply(ctx, ac, client.FieldOwner("test"))).To(Succeed())
+		return resourceVersion(g, ptr.Deref(ac.ResourceVersion, ""))
+	}
+	deleteObject := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		g.Expect(c.Delete(ctx, d)).To(Succeed())
+		if err := c.Get(ctx, client.ObjectKeyFromObject(d), d); err != nil {
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected a NotFound error, got %v", err)
+			return 0
+		}
+		return resourceVersion(g, d.GetResourceVersion())
+	}
+	deleteObjectWithoutUID := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		d.SetUID("")
+		g.Expect(c.Delete(ctx, d)).To(Succeed())
+		return 0
+	}
+	deleteObjectWithUIDPrecondition := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		uid := d.GetUID()
+		d.SetUID("")
+		g.Expect(c.Delete(ctx, d, client.Preconditions{UID: &uid})).To(Succeed())
+		return 0
+	}
+	updateStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d)).To(Succeed())
+		d.Status.Replicas = 5
+		g.Expect(c.Status().Update(ctx, d)).To(Succeed())
+		return resourceVersion(g, d.GetResourceVersion())
+	}
+	patchStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		patch := client.MergeFrom(d.DeepCopyObject().(client.Object))
+		d.Status.Replicas = 6
+		g.Expect(c.Status().Patch(ctx, d, patch)).To(Succeed())
+		return resourceVersion(g, d.GetResourceVersion())
+	}
+	applyStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		ac := appsv1applyconfigurations.Deployment("test", namespace).
+			WithStatus(appsv1applyconfigurations.DeploymentStatus().WithReplicas(7))
+		g.Expect(c.Status().Apply(ctx, ac, client.FieldOwner("test"))).To(Succeed())
+		return resourceVersion(g, ptr.Deref(ac.ResourceVersion, ""))
+	}
+	updateScale := func(ctx context.Context, c client.Client, g *WithT) int64 {
+		d := deployment()
+		scale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 8}}
+		g.Expect(c.SubResource("scale").Update(ctx, d, client.WithSubResourceBody(scale))).To(Succeed())
+		return resourceVersion(g, d.GetResourceVersion())
+	}
+
+	get := func(ctx context.Context, c client.Client, g *WithT, writtenRV <-chan int64) {
+		result := deployment()
+		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(result), result)).To(Succeed())
+		g.Expect(resourceVersion(g, result.GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
+	}
+	list := func(ctx context.Context, c client.Client, g *WithT, writtenRV <-chan int64) {
+		result := &appsv1.DeploymentList{}
+		g.Expect(c.List(ctx, result)).To(Succeed())
+		g.Expect(result.Items).To(HaveLen(1))
+		g.Expect(resourceVersion(g, result.Items[0].GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
+	}
+	getDeleted := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
+		d := deployment()
+		err := c.Get(ctx, client.ObjectKeyFromObject(d), d)
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected a NotFound error, got %v", err)
+	}
+	listDeleted := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
+		result := &appsv1.DeploymentList{}
+		g.Expect(c.List(ctx, result)).To(Succeed())
+		g.Expect(result.Items).To(BeEmpty())
+	}
+	getTerminating := func(ctx context.Context, c client.Client, g *WithT, writtenRV <-chan int64) {
+		result := deployment()
+		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(result), result)).To(Succeed())
+		g.Expect(result.GetDeletionTimestamp()).ToNot(BeNil(), "expected the deletionTimestamp to be set")
+		g.Expect(result.GetFinalizers()).To(ConsistOf("test.io/finalizer"))
+		g.Expect(resourceVersion(g, result.GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
+	}
+	listTerminating := func(ctx context.Context, c client.Client, g *WithT, writtenRV <-chan int64) {
+		result := &appsv1.DeploymentList{}
+		g.Expect(c.List(ctx, result)).To(Succeed())
+		g.Expect(result.Items).To(HaveLen(1))
+		g.Expect(result.Items[0].GetDeletionTimestamp()).ToNot(BeNil(), "expected the deletionTimestamp to be set")
+		g.Expect(result.Items[0].GetFinalizers()).To(ConsistOf("test.io/finalizer"))
+		g.Expect(resourceVersion(g, result.Items[0].GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
+	}
+
+	testCases := []struct {
+		name            string
+		maybeInitObject func() *appsv1.Deployment
+		write           func(ctx context.Context, client client.Client, g *WithT) int64
+		read            func(ctx context.Context, client client.Client, g *WithT, writtenRV <-chan int64)
+	}{
+		{
+			name:  "Get after Create",
+			write: create,
+			read:  get,
+		},
+		{
+			name:  "List after Create",
+			write: create,
+			read:  list,
+		},
+		{
+			name:            "Get after Update",
+			maybeInitObject: deployment,
+			write:           update,
+			read:            get,
+		},
+		{
+			name:            "List after Update",
+			maybeInitObject: deployment,
+			write:           update,
+			read:            list,
+		},
+		{
+			name:            "Get after Patch",
+			maybeInitObject: deployment,
+			write:           patch,
+			read:            get,
+		},
+		{
+			name:            "List after Patch",
+			maybeInitObject: deployment,
+			write:           patch,
+			read:            list,
+		},
+		{
+			name:  "Get after Apply",
+			write: apply,
+			read:  get,
+		},
+		{
+			name:  "List after Apply",
+			write: apply,
+			read:  list,
+		},
+		{
+			name:            "Get after Delete",
+			maybeInitObject: deployment,
+			write:           deleteObject,
+			read:            getDeleted,
+		},
+		{
+			name:            "List after Delete",
+			maybeInitObject: deployment,
+			write:           deleteObject,
+			read:            listDeleted,
+		},
+		{
+			name:            "Get after Delete of an object without uid",
+			maybeInitObject: deployment,
+			write:           deleteObjectWithoutUID,
+			read:            getDeleted,
+		},
+		{
+			name:            "List after Delete of an object without uid",
+			maybeInitObject: deployment,
+			write:           deleteObjectWithoutUID,
+			read:            listDeleted,
+		},
+		{
+			name:            "Get after Delete of an object whose uid is only in the preconditions",
+			maybeInitObject: deployment,
+			write:           deleteObjectWithUIDPrecondition,
+			read:            getDeleted,
+		},
+		{
+			name:            "List after Delete of an object whose uid is only in the preconditions",
+			maybeInitObject: deployment,
+			write:           deleteObjectWithUIDPrecondition,
+			read:            listDeleted,
+		},
+		{
+			name:            "Get after Delete of an object with finalizers",
+			maybeInitObject: deploymentWithFinalizer,
+			write:           deleteObject,
+			read:            getTerminating,
+		},
+		{
+			name:            "List after Delete of an object with finalizers",
+			maybeInitObject: deploymentWithFinalizer,
+			write:           deleteObject,
+			read:            listTerminating,
+		},
+		{
+			name:            "Get after status Update",
+			maybeInitObject: deployment,
+			write:           updateStatus,
+			read:            get,
+		},
+		{
+			name:            "List after status Update",
+			maybeInitObject: deployment,
+			write:           updateStatus,
+			read:            list,
+		},
+		{
+			name:            "Get after status Patch",
+			maybeInitObject: deployment,
+			write:           patchStatus,
+			read:            get,
+		},
+		{
+			name:            "List after status Patch",
+			maybeInitObject: deployment,
+			write:           patchStatus,
+			read:            list,
+		},
+		{
+			name:            "Get after status Apply",
+			maybeInitObject: deployment,
+			write:           applyStatus,
+			read:            get,
+		},
+		{
+			name:            "List after status Apply",
+			maybeInitObject: deployment,
+			write:           applyStatus,
+			read:            list,
+		},
+		{
+			name:            "Get after scale Update",
+			maybeInitObject: deployment,
+			write:           updateScale,
+			read:            get,
+		},
+		{
+			name:            "List after scale Update",
+			maybeInitObject: deployment,
+			write:           updateScale,
+			read:            list,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				g := NewWithT(t)
+				barrier := keyWriteBarrierWithBeginCallback{WriteBarrier: writebarrier.NewWriteBarrier()}
+
+				var initObjects []client.Object
+				if tc.maybeInitObject != nil {
+					initObjects = []client.Object{tc.maybeInitObject()}
+				}
+				c := newConsistentFakeClient(t, &barrier, initObjects...)
+				synctest.Wait() // wait for cache start to finish
+
+				writtenRV := make(chan int64, 1)
+				callBackFinished := make(chan struct{})
+				barrier.beginCallback = sync.OnceFunc(func() {
+					// Must happen in a goroutine otherwise we deadlock, as we are waiting for the write to finish while
+					// blocking it from starting.
+					go func() {
+						defer close(callBackFinished)
+
+						tc.read(t.Context(), c, g, writtenRV)
+					}()
+				})
+				writtenRV <- tc.write(t.Context(), c, g)
+
+				<-callBackFinished
+			})
+		})
+	}
+}
+
 // watchDelay is how long the fake cache lags behind the fake client.
 const watchDelay = 10 * time.Second
 
@@ -256,318 +577,4 @@ func (k *keyWriteBarrierWithBeginCallback) Begin() func() {
 	release := k.WriteBarrier.Begin()
 	k.beginCallback()
 	return release
-}
-
-// TestConsistentFakeClient uses a callback on the start of a write operation
-// to start a read operation, then validates the read operation observes the write.
-// It uses a fake cache with a fixed ten seconds delay in synctest, to avoid having to
-// wait ten seconds of wallclock time.
-//
-// It tests the cross product of all write operations and get and list.
-func TestConsistentFakeClient(t *testing.T) {
-	t.Parallel()
-
-	const namespace = "default"
-
-	deployment := func() *appsv1.Deployment {
-		return &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: namespace, UID: "test-uid"},
-		}
-	}
-
-	deploymentWithFinalizer := func() *appsv1.Deployment {
-		d := deployment()
-		d.SetFinalizers([]string{"test.io/finalizer"})
-		return d
-	}
-
-	resourceVersion := func(g *WithT, rv string) int64 {
-		parsed, err := strconv.ParseInt(rv, 10, 64)
-		g.Expect(err).NotTo(HaveOccurred(), "failed to parse resource version %q", rv)
-		return parsed
-	}
-
-	create := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		d := deployment()
-		g.Expect(c.Create(ctx, d)).To(Succeed())
-		return resourceVersion(g, d.GetResourceVersion())
-	}
-	update := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		d := deployment()
-		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d)).To(Succeed())
-		d.SetLabels(map[string]string{"updated": "true"})
-		g.Expect(c.Update(ctx, d)).To(Succeed())
-		return resourceVersion(g, d.GetResourceVersion())
-	}
-	patch := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		d := deployment()
-		patch := client.MergeFrom(d.DeepCopyObject().(client.Object))
-		d.SetLabels(map[string]string{"patched": "true"})
-		g.Expect(c.Patch(ctx, d, patch)).To(Succeed())
-		return resourceVersion(g, d.GetResourceVersion())
-	}
-	apply := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		ac := appsv1applyconfigurations.Deployment(deployment().GetName(), namespace).
-			WithLabels(map[string]string{"applied": "true"})
-		g.Expect(c.Apply(ctx, ac, client.FieldOwner("test"))).To(Succeed())
-		return resourceVersion(g, ptr.Deref(ac.ResourceVersion, ""))
-	}
-	deleteObject := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		g.Expect(c.Delete(ctx, deployment())).To(Succeed())
-		return 0
-	}
-	deleteObjectWithoutUID := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		d := deployment()
-		d.SetUID("")
-		g.Expect(c.Delete(ctx, d)).To(Succeed())
-		return 0
-	}
-	deleteObjectWithUIDPrecondition := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		d := deployment()
-		uid := d.GetUID()
-		d.SetUID("")
-		g.Expect(c.Delete(ctx, d, client.Preconditions{UID: &uid})).To(Succeed())
-		return 0
-	}
-	updateStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		d := deployment()
-		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d)).To(Succeed())
-		d.Status.Replicas = 5
-		g.Expect(c.Status().Update(ctx, d)).To(Succeed())
-		return resourceVersion(g, d.GetResourceVersion())
-	}
-	patchStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		d := deployment()
-		patch := client.MergeFrom(d.DeepCopyObject().(client.Object))
-		d.Status.Replicas = 6
-		g.Expect(c.Status().Patch(ctx, d, patch)).To(Succeed())
-		return resourceVersion(g, d.GetResourceVersion())
-	}
-	applyStatus := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		ac := appsv1applyconfigurations.Deployment("test", namespace).
-			WithStatus(appsv1applyconfigurations.DeploymentStatus().WithReplicas(7))
-		g.Expect(c.Status().Apply(ctx, ac, client.FieldOwner("test"))).To(Succeed())
-		return resourceVersion(g, ptr.Deref(ac.ResourceVersion, ""))
-	}
-	updateScale := func(ctx context.Context, c client.Client, g *WithT) int64 {
-		d := deployment()
-		scale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 8}}
-		g.Expect(c.SubResource("scale").Update(ctx, d, client.WithSubResourceBody(scale))).To(Succeed())
-		return resourceVersion(g, d.GetResourceVersion())
-	}
-
-	get := func(ctx context.Context, c client.Client, g *WithT, writtenRV <-chan int64) {
-		result := deployment()
-		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(result), result)).To(Succeed())
-		g.Expect(resourceVersion(g, result.GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
-	}
-	list := func(ctx context.Context, c client.Client, g *WithT, writtenRV <-chan int64) {
-		result := &appsv1.DeploymentList{}
-		g.Expect(c.List(ctx, result)).To(Succeed())
-		g.Expect(result.Items).To(HaveLen(1))
-		g.Expect(resourceVersion(g, result.Items[0].GetResourceVersion())).To(BeNumerically(">=", <-writtenRV))
-	}
-	getDeleted := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
-		d := deployment()
-		err := c.Get(ctx, client.ObjectKeyFromObject(d), d)
-		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected a NotFound error, got %v", err)
-	}
-	listDeleted := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
-		result := &appsv1.DeploymentList{}
-		g.Expect(c.List(ctx, result)).To(Succeed())
-		g.Expect(result.Items).To(BeEmpty())
-	}
-	getTerminating := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
-		result := deployment()
-		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(result), result)).To(Succeed())
-		g.Expect(result.GetDeletionTimestamp()).ToNot(BeNil(), "expected the deletionTimestamp to be set")
-		g.Expect(result.GetFinalizers()).To(ConsistOf("test.io/finalizer"))
-	}
-	listTerminating := func(ctx context.Context, c client.Client, g *WithT, _ <-chan int64) {
-		result := &appsv1.DeploymentList{}
-		g.Expect(c.List(ctx, result)).To(Succeed())
-		g.Expect(result.Items).To(HaveLen(1))
-		g.Expect(result.Items[0].GetDeletionTimestamp()).ToNot(BeNil(), "expected the deletionTimestamp to be set")
-		g.Expect(result.Items[0].GetFinalizers()).To(ConsistOf("test.io/finalizer"))
-	}
-
-	testCases := []struct {
-		name            string
-		maybeInitObject func() *appsv1.Deployment
-		write           func(ctx context.Context, client client.Client, g *WithT) int64
-		read            func(ctx context.Context, client client.Client, g *WithT, writtenRV <-chan int64)
-	}{
-		{
-			name:  "Get after Create",
-			write: create,
-			read:  get,
-		},
-		{
-			name:  "List after Create",
-			write: create,
-			read:  list,
-		},
-		{
-			name:            "Get after Update",
-			maybeInitObject: deployment,
-			write:           update,
-			read:            get,
-		},
-		{
-			name:            "List after Update",
-			maybeInitObject: deployment,
-			write:           update,
-			read:            list,
-		},
-		{
-			name:            "Get after Patch",
-			maybeInitObject: deployment,
-			write:           patch,
-			read:            get,
-		},
-		{
-			name:            "List after Patch",
-			maybeInitObject: deployment,
-			write:           patch,
-			read:            list,
-		},
-		{
-			name:  "Get after Apply",
-			write: apply,
-			read:  get,
-		},
-		{
-			name:  "List after Apply",
-			write: apply,
-			read:  list,
-		},
-		{
-			name:            "Get after Delete",
-			maybeInitObject: deployment,
-			write:           deleteObject,
-			read:            getDeleted,
-		},
-		{
-			name:            "List after Delete",
-			maybeInitObject: deployment,
-			write:           deleteObject,
-			read:            listDeleted,
-		},
-		{
-			name:            "Get after Delete of an object without uid",
-			maybeInitObject: deployment,
-			write:           deleteObjectWithoutUID,
-			read:            getDeleted,
-		},
-		{
-			name:            "List after Delete of an object without uid",
-			maybeInitObject: deployment,
-			write:           deleteObjectWithoutUID,
-			read:            listDeleted,
-		},
-		{
-			name:            "Get after Delete of an object whose uid is only in the preconditions",
-			maybeInitObject: deployment,
-			write:           deleteObjectWithUIDPrecondition,
-			read:            getDeleted,
-		},
-		{
-			name:            "List after Delete of an object whose uid is only in the preconditions",
-			maybeInitObject: deployment,
-			write:           deleteObjectWithUIDPrecondition,
-			read:            listDeleted,
-		},
-		{
-			name:            "Get after Delete of an object with finalizers",
-			maybeInitObject: deploymentWithFinalizer,
-			write:           deleteObject,
-			read:            getTerminating,
-		},
-		{
-			name:            "List after Delete of an object with finalizers",
-			maybeInitObject: deploymentWithFinalizer,
-			write:           deleteObject,
-			read:            listTerminating,
-		},
-		{
-			name:            "Get after status Update",
-			maybeInitObject: deployment,
-			write:           updateStatus,
-			read:            get,
-		},
-		{
-			name:            "List after status Update",
-			maybeInitObject: deployment,
-			write:           updateStatus,
-			read:            list,
-		},
-		{
-			name:            "Get after status Patch",
-			maybeInitObject: deployment,
-			write:           patchStatus,
-			read:            get,
-		},
-		{
-			name:            "List after status Patch",
-			maybeInitObject: deployment,
-			write:           patchStatus,
-			read:            list,
-		},
-		{
-			name:            "Get after status Apply",
-			maybeInitObject: deployment,
-			write:           applyStatus,
-			read:            get,
-		},
-		{
-			name:            "List after status Apply",
-			maybeInitObject: deployment,
-			write:           applyStatus,
-			read:            list,
-		},
-		{
-			name:            "Get after scale Update",
-			maybeInitObject: deployment,
-			write:           updateScale,
-			read:            get,
-		},
-		{
-			name:            "List after scale Update",
-			maybeInitObject: deployment,
-			write:           updateScale,
-			read:            list,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			synctest.Test(t, func(t *testing.T) {
-				g := NewWithT(t)
-				barrier := keyWriteBarrierWithBeginCallback{WriteBarrier: writebarrier.NewWriteBarrier()}
-
-				var initObjects []client.Object
-				if tc.maybeInitObject != nil {
-					initObjects = []client.Object{tc.maybeInitObject()}
-				}
-				c := newConsistentFakeClient(t, &barrier, initObjects...)
-				synctest.Wait() // wait for cache start to finish
-
-				writtenRV := make(chan int64, 1)
-				callBackFinished := make(chan struct{})
-				barrier.beginCallback = sync.OnceFunc(func() {
-					// Must happen in a goroutine otherwise we deadlock, as we are waiting for the write to finish while
-					// blocking it from starting.
-					go func() {
-						defer close(callBackFinished)
-
-						tc.read(t.Context(), c, g, writtenRV)
-					}()
-				})
-				writtenRV <- tc.write(t.Context(), c, g)
-
-				<-callBackFinished
-			})
-		})
-	}
 }

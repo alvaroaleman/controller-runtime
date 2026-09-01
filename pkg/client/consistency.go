@@ -100,22 +100,21 @@ const (
 
 func (c *consistentClient) getConsistencyHandler(
 	ctx context.Context,
-	gvk schema.GroupVersionKind,
+	gvkAndRepresentation gvkAndRepresentation,
 	obj Object,
-	representation representationID,
 ) (*consistencyhandler.ConsistencyHandler, error) {
-	h := c.consistencyHandlers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation})
+	h := c.consistencyHandlers.getOrCreate(gvkAndRepresentation)
 	if h.Registered() {
 		return h, nil
 	}
 
 	informer, err := c.informers.GetInformer(ctx, obj, cacheapi.BlockUntilSynced(true))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get informer for GVK %s: %w", gvk, err)
+		return nil, fmt.Errorf("failed to get informer for GVK %s: %w", gvkAndRepresentation.gvk, err)
 	}
 
 	if err := h.Register(ctx, informer); err != nil {
-		return nil, fmt.Errorf("failed to register consistency handler on informer for GVK %s: %w", gvk, err)
+		return nil, fmt.Errorf("failed to register consistency handler on informer for GVK %s: %w", gvkAndRepresentation.gvk, err)
 	}
 	return h, nil
 }
@@ -125,15 +124,15 @@ func (c *consistentClient) Get(ctx context.Context, key ObjectKey, obj Object, o
 	if err != nil {
 		return fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
 	}
-	representation := representationIDForObj(obj)
+	gvkAndRepresentation := gvkAndRepresentation{gvk: gvk, representation: representationIDForObj(obj)}
 
 	select {
-	case <-c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).Seal(key):
+	case <-c.writeBarriers.getOrCreate(gvkAndRepresentation).Seal(key):
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 
-	h, err := c.getConsistencyHandler(ctx, gvk, obj, representation)
+	h, err := c.getConsistencyHandler(ctx, gvkAndRepresentation, obj)
 	if err != nil {
 		return err
 	}
@@ -150,9 +149,9 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 		return fmt.Errorf("failed to get GVK for list %T: %w", list, err)
 	}
 	gvk.Kind = strings.TrimSuffix(gvk.Kind, "List")
-	representation := representationIDForObj(list)
+	gvkAndRepresentation := gvkAndRepresentation{gvk: gvk, representation: representationIDForObj(list)}
 
-	for _, s := range c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).SealAll() {
+	for _, s := range c.writeBarriers.getOrCreate(gvkAndRepresentation).SealAll() {
 		select {
 		case <-s:
 		case <-ctx.Done():
@@ -161,7 +160,7 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 	}
 
 	var obj Object
-	switch representation {
+	switch gvkAndRepresentation.representation {
 	case representationIDUnstructured:
 		u := &unstructured.Unstructured{}
 		u.SetGroupVersionKind(gvk)
@@ -182,7 +181,7 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 		obj = asserted
 	}
 
-	h, err := c.getConsistencyHandler(ctx, gvk, obj, representation)
+	h, err := c.getConsistencyHandler(ctx, gvkAndRepresentation, obj)
 	if err != nil {
 		return err
 	}
@@ -221,7 +220,7 @@ func writeTargetFor(obj any, scheme *runtime.Scheme) (schema.GroupVersionKind, t
 	switch t := obj.(type) {
 	case *unstructuredApplyConfiguration:
 		return t.Unstructured.GroupVersionKind(),
-			types.NamespacedName{Namespace: t.Unstructured.GetNamespace(), Name: t.Unstructured.GetName()},
+			ObjectKeyFromObject(t),
 			t.Unstructured,
 			func() (string, error) { return t.Unstructured.GetResourceVersion(), nil },
 			nil
@@ -265,16 +264,16 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write 
 	if err != nil {
 		return err
 	}
-	representation := representationIDForObj(cacheObj)
+	gvkAndRepresentation := gvkAndRepresentation{gvk: gvk, representation: representationIDForObj(cacheObj)}
 
 	// We don't technically need an informer since the RV is monotonically increasing, but we want to fail
 	// ASAP if the cache can not be setup.
-	h, err := c.getConsistencyHandler(ctx, gvk, cacheObj, representation)
+	h, err := c.getConsistencyHandler(ctx, gvkAndRepresentation, cacheObj)
 	if err != nil {
 		return err
 	}
 
-	release := c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).Begin(namespacedName)
+	release := c.writeBarriers.getOrCreate(gvkAndRepresentation).Begin(namespacedName)
 	defer release()
 
 	if err := write(); err != nil {
@@ -322,19 +321,19 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 		return fmt.Errorf("failed to get GVK for object %v: %w", obj, err)
 	}
 
-	representation := representationIDForObj(obj)
-	h, err := c.getConsistencyHandler(ctx, gvk, obj, representation)
+	gvkAndRepresentation := gvkAndRepresentation{gvk: gvk, representation: representationIDForObj(obj)}
+	h, err := c.getConsistencyHandler(ctx, gvkAndRepresentation, obj)
 	if err != nil {
 		return err
 	}
 
-	namespacedName := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
+	namespacedName := ObjectKeyFromObject(obj)
 	uid, err := c.uidForDelete(ctx, gvk, namespacedName, obj, opts...)
 	if err != nil {
 		return err
 	}
 
-	release := c.writeBarriers.getOrCreate(gvkAndRepresentation{gvk: gvk, representation: representation}).Begin(namespacedName)
+	release := c.writeBarriers.getOrCreate(gvkAndRepresentation).Begin(namespacedName)
 	defer release()
 
 	// Register the delete before we execute it, otherwise it may be in the cache

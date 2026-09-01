@@ -35,7 +35,7 @@ type WriteBarriers interface {
 	SealAll() []<-chan struct{}
 }
 
-// NewWriteBarriers construct WriteBarrierrs. newBarrier is configurable for testing purposes only.
+// NewWriteBarriers construct WriteBarriers. newBarrier is configurable for testing purposes only.
 func NewWriteBarriers(newBarrier func() WriteBarrier) WriteBarriers {
 	return &writeBarriers{
 		data:       map[types.NamespacedName]*writeBarrierWithRefCounter{},
@@ -110,27 +110,6 @@ func init() {
 	close(closedChannel)
 }
 
-type writeBatch struct {
-	barrier  *keyWriteBarrier
-	inFlight int
-	done     chan struct{}
-}
-
-func (w *writeBatch) release() {
-	w.barrier.mutex.Lock()
-	defer w.barrier.mutex.Unlock()
-
-	w.inFlight--
-	if w.inFlight > 0 {
-		return
-	}
-
-	close(w.done)
-	if w.barrier.current == w {
-		w.barrier.current = nil
-	}
-}
-
 type WriteBarrier interface {
 	Begin() (release func())
 	Seal() <-chan struct{}
@@ -143,8 +122,8 @@ func NewWriteBarrier() WriteBarrier {
 
 // keyWriteBarrier allows to wait for a set of in-flight writes to finish.
 type keyWriteBarrier struct {
-	// mutex must be held to access current
-	mutex sync.Mutex
+	// lock must be held to access current or previous.
+	lock sync.Mutex
 
 	// current is the current write batch. It has a reference to the key write
 	// barrier that it uses to delete itself once done.
@@ -156,8 +135,8 @@ type keyWriteBarrier struct {
 
 // Begin adds a write to the current batch, starting one if needed.
 func (b *keyWriteBarrier) Begin() func() {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+	b.lock.Lock()
+	defer b.lock.Unlock()
 
 	if b.current == nil {
 		b.current = &writeBatch{barrier: b, done: make(chan struct{})}
@@ -168,19 +147,21 @@ func (b *keyWriteBarrier) Begin() func() {
 }
 
 func (b *keyWriteBarrier) Seal() <-chan struct{} {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+	b.lock.Lock()
+	defer b.lock.Unlock()
 
 	if b.current == nil {
 		return b.previous
 	}
 
+	// Create a new chan that blocks until both previous
+	// and current are done.
 	done := make(chan struct{})
-	current := b.current.done
-	b.current = nil
-
 	previous := b.previous
 	b.previous = done
+
+	current := b.current.done
+	b.current = nil
 
 	go func() {
 		for _, c := range []<-chan struct{}{previous, current} {
@@ -190,4 +171,25 @@ func (b *keyWriteBarrier) Seal() <-chan struct{} {
 	}()
 
 	return done
+}
+
+type writeBatch struct {
+	barrier  *keyWriteBarrier
+	inFlight int
+	done     chan struct{}
+}
+
+func (w *writeBatch) release() {
+	w.barrier.lock.Lock()
+	defer w.barrier.lock.Unlock()
+
+	w.inFlight--
+	if w.inFlight > 0 {
+		return
+	}
+
+	close(w.done)
+	if w.barrier.current == w {
+		w.barrier.current = nil
+	}
 }

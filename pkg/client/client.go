@@ -98,6 +98,9 @@ type CacheOptions struct {
 	// block until the cache observed all write requests that started before the read
 	// request. Lists will wait for all pending write requests to the gvk the List is for.
 	//
+	// The blocking is always scoped to the representation (typed, unstructured or
+	// PartialObjectMetadata), meaning a write only blocks reads of the same representation.
+	//
 	// This is an experimental feature, a form of this will be kept but both the details of
 	// how exactly it works and how exactly it is configured may change.
 	//
