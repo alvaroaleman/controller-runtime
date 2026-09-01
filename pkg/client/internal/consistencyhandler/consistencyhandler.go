@@ -38,6 +38,7 @@ func NewHandler(log logr.Logger) *ConsistencyHandler {
 		pendingDeletes:            make(map[types.NamespacedName]sets.Set[types.UID]),
 		minimumRVs:                make(map[types.NamespacedName]int64),
 		log:                       log,
+		triggerCleanup:            make(chan struct{}, 1),
 	}
 }
 
@@ -55,16 +56,21 @@ type ConsistencyHandler struct {
 	// accessed when holding minimumRVsLock.
 	minimumRVs map[types.NamespacedName]int64
 
-	registerLock sync.Mutex
+	registerLock sync.RWMutex
 	registered   bool
 	registration *cache.ResourceEventHandlerRegistration
 
 	log logr.Logger
+
+	// triggerCleanup triggers the cleanup of pendingRVs that are smaller
+	// than observedRV. It holds a one element buffered channel, because
+	// having more than one queued cleanup doesn't make sense.
+	triggerCleanup chan struct{}
 }
 
 func (h *ConsistencyHandler) Registered() bool {
-	h.registerLock.Lock()
-	defer h.registerLock.Unlock()
+	h.registerLock.RLock()
+	defer h.registerLock.RUnlock()
 	return h.registered
 }
 
@@ -126,11 +132,11 @@ func (h *ConsistencyHandler) getMinimumRVForGVK() int64 {
 	return maxRV
 }
 
-func (h *ConsistencyHandler) cleanupMinimumRVs(currentRV int64) {
+func (h *ConsistencyHandler) cleanupMinimumRVs() {
 	h.minimumRVsLock.Lock()
 	defer h.minimumRVsLock.Unlock()
 	for key, rv := range h.minimumRVs {
-		if rv <= currentRV {
+		if rv <= h.observedRV.Load() {
 			delete(h.minimumRVs, key)
 		}
 	}
@@ -184,8 +190,7 @@ func (h *ConsistencyHandler) WaitForGet(ctx context.Context, key types.Namespace
 	pendingDeletes := maps.Clone(h.pendingDeletes[key])
 	h.pendingDeletesLock.RUnlock()
 
-	rv := h.getMinimumRVForKey(key)
-	if err := h.waitForRV(ctx, rv); err != nil {
+	if err := h.waitForRV(ctx, h.getMinimumRVForKey(key)); err != nil {
 		return err
 	}
 
@@ -246,7 +251,7 @@ func (h *ConsistencyHandler) waitForRV(ctx context.Context, rv int64) error {
 		case <-updatedChan:
 			continue
 		case <-ctx.Done():
-			return fmt.Errorf("failed waiting for resource version %d to be observed: %w", rv, ctx.Err())
+			return fmt.Errorf("failed waiting to observe resource version %d: %w", rv, ctx.Err())
 		}
 	}
 }
@@ -271,7 +276,12 @@ func (h *ConsistencyHandler) observeResourceVersion(rv string) {
 
 	h.rvBroadCaster.broadcast()
 
-	go h.cleanupMinimumRVs(parsed)
+	select {
+	case h.triggerCleanup <- struct{}{}:
+		h.cleanupMinimumRVs()
+		<-h.triggerCleanup
+	default:
+	}
 }
 
 func (h *ConsistencyHandler) OnAdd(raw any, _ bool) {
