@@ -120,6 +120,10 @@ func (c *consistentClient) getConsistencyHandler(
 }
 
 func (c *consistentClient) Get(ctx context.Context, key ObjectKey, obj Object, opts ...GetOption) error {
+	if (&GetOptions{}).ApplyOptions(opts).DisableReadWriteConsistency {
+		return c.upstream.Get(ctx, key, obj, opts...)
+	}
+
 	gvk, err := apiutil.GVKForObject(obj, c.upstream.Scheme())
 	if err != nil {
 		return fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
@@ -144,6 +148,10 @@ func (c *consistentClient) Get(ctx context.Context, key ObjectKey, obj Object, o
 }
 
 func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...ListOption) error {
+	if (&ListOptions{}).ApplyOptions(opts).DisableReadWriteConsistency {
+		return c.upstream.List(ctx, list, opts...)
+	}
+
 	gvk, err := apiutil.GVKForObject(list, c.upstream.Scheme())
 	if err != nil {
 		return fmt.Errorf("failed to get GVK for list %T: %w", list, err)
@@ -193,25 +201,25 @@ func (c *consistentClient) List(ctx context.Context, list ObjectList, opts ...Li
 }
 
 func (c *consistentClient) Create(ctx context.Context, obj Object, opts ...CreateOption) error {
-	return c.writeAndRecordRV(ctx, obj, func() error {
+	return c.writeAndRecordRV(ctx, obj, (&CreateOptions{}).ApplyOptions(opts).DisableReadWriteConsistency, func() error {
 		return c.upstream.Create(ctx, obj, opts...)
 	})
 }
 
 func (c *consistentClient) Update(ctx context.Context, obj Object, opts ...UpdateOption) error {
-	return c.writeAndRecordRV(ctx, obj, func() error {
+	return c.writeAndRecordRV(ctx, obj, (&UpdateOptions{}).ApplyOptions(opts).DisableReadWriteConsistency, func() error {
 		return c.upstream.Update(ctx, obj, opts...)
 	})
 }
 
 func (c *consistentClient) Patch(ctx context.Context, obj Object, patch Patch, opts ...PatchOption) error {
-	return c.writeAndRecordRV(ctx, obj, func() error {
+	return c.writeAndRecordRV(ctx, obj, (&PatchOptions{}).ApplyOptions(opts).DisableReadWriteConsistency, func() error {
 		return c.upstream.Patch(ctx, obj, patch, opts...)
 	})
 }
 
 func (c *consistentClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...ApplyOption) error {
-	return c.writeAndRecordRV(ctx, obj, func() error {
+	return c.writeAndRecordRV(ctx, obj, (&ApplyOptions{}).ApplyOptions(opts).DisableReadWriteConsistency, func() error {
 		return c.upstream.Apply(ctx, obj, opts...)
 	})
 }
@@ -259,7 +267,11 @@ func writeTargetFor(obj any, scheme *runtime.Scheme) (schema.GroupVersionKind, t
 	}
 }
 
-func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, write func() error) error {
+func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, disableConsistency bool, write func() error) error {
+	if disableConsistency {
+		return write()
+	}
+
 	gvk, namespacedName, cacheObj, getResourceVersion, err := writeTargetFor(obj, c.upstream.Scheme())
 	if err != nil {
 		return err
@@ -316,6 +328,10 @@ func resourceVersionFromApplyConfiguration(obj applyConfiguration) (string, erro
 }
 
 func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...DeleteOption) error {
+	if (&DeleteOptions{}).ApplyOptions(opts).DisableReadWriteConsistency {
+		return c.upstream.Delete(ctx, obj, opts...)
+	}
+
 	gvk, err := apiutil.GVKForObject(obj, c.upstream.Scheme())
 	if err != nil {
 		return fmt.Errorf("failed to get GVK for object %v: %w", obj, err)
@@ -414,7 +430,7 @@ func (c *consistentClient) SubResource(subResource string) SubResourceClient {
 }
 
 type consistentSubResourceClient struct {
-	writeAndRecordRV func(context.Context, any, func() error) error
+	writeAndRecordRV func(ctx context.Context, obj any, disableConsistency bool, write func() error) error
 	upstream         SubResourceClient
 }
 
@@ -423,25 +439,25 @@ func (c *consistentSubResourceClient) Get(ctx context.Context, obj, subResource 
 }
 
 func (c *consistentSubResourceClient) Create(ctx context.Context, obj, subResource Object, opts ...SubResourceCreateOption) error {
-	return c.writeAndRecordRV(ctx, obj, func() error {
+	return c.writeAndRecordRV(ctx, obj, (&SubResourceCreateOptions{}).ApplyOptions(opts).DisableReadWriteConsistency, func() error {
 		return c.upstream.Create(ctx, obj, subResource, opts...)
 	})
 }
 
 func (c *consistentSubResourceClient) Update(ctx context.Context, obj Object, opts ...SubResourceUpdateOption) error {
-	return c.writeAndRecordRV(ctx, obj, func() error {
+	return c.writeAndRecordRV(ctx, obj, (&SubResourceUpdateOptions{}).ApplyOptions(opts).DisableReadWriteConsistency, func() error {
 		return c.upstream.Update(ctx, obj, opts...)
 	})
 }
 
 func (c *consistentSubResourceClient) Patch(ctx context.Context, obj Object, patch Patch, opts ...SubResourcePatchOption) error {
-	return c.writeAndRecordRV(ctx, obj, func() error {
+	return c.writeAndRecordRV(ctx, obj, (&SubResourcePatchOptions{}).ApplyOptions(opts).DisableReadWriteConsistency, func() error {
 		return c.upstream.Patch(ctx, obj, patch, opts...)
 	})
 }
 
 func (c *consistentSubResourceClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...SubResourceApplyOption) error {
-	return c.writeAndRecordRV(ctx, obj, func() error {
+	return c.writeAndRecordRV(ctx, obj, (&SubResourceApplyOptions{}).ApplyOpts(opts).DisableReadWriteConsistency, func() error {
 		return c.upstream.Apply(ctx, obj, opts...)
 	})
 }

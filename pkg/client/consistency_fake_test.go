@@ -364,6 +364,164 @@ func TestConsistentFakeClient(t *testing.T) {
 	}
 }
 
+func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
+	t.Parallel()
+
+	const namespace = "default"
+
+	deployment := func() *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: namespace, UID: "test-uid"},
+		}
+	}
+
+	get := func(ctx context.Context, c client.Client, g *WithT) {
+		d := deployment()
+		g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d)).To(Succeed())
+	}
+	list := func(ctx context.Context, c client.Client, g *WithT) {
+		g.Expect(c.List(ctx, &appsv1.DeploymentList{})).To(Succeed())
+	}
+
+	testCases := []struct {
+		name            string
+		maybeInitObject func() *appsv1.Deployment
+		write           func(ctx context.Context, client client.Client, g *WithT)
+		read            func(ctx context.Context, client client.Client, g *WithT)
+	}{
+		{
+			name: "Get",
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				g.Expect(c.Create(ctx, deployment())).To(Succeed())
+			},
+			read: func(ctx context.Context, c client.Client, g *WithT) {
+				d := deployment()
+				g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d, client.DisableReadWriteConsistency)).To(Succeed())
+			},
+		},
+		{
+			name: "List",
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				g.Expect(c.Create(ctx, deployment())).To(Succeed())
+			},
+			read: func(ctx context.Context, c client.Client, g *WithT) {
+				g.Expect(c.List(ctx, &appsv1.DeploymentList{}, client.DisableReadWriteConsistency)).To(Succeed())
+			},
+		},
+		{
+			name: "Create",
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				g.Expect(c.Create(ctx, deployment(), client.DisableReadWriteConsistency)).To(Succeed())
+			},
+			read: get,
+		},
+		{
+			name:            "Update",
+			maybeInitObject: deployment,
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				d := deployment()
+				d.SetLabels(map[string]string{"updated": "true"})
+				g.Expect(c.Update(ctx, d, client.DisableReadWriteConsistency)).To(Succeed())
+			},
+			read: get,
+		},
+		{
+			name:            "Patch",
+			maybeInitObject: deployment,
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				d := deployment()
+				patch := client.MergeFrom(d.DeepCopyObject().(client.Object))
+				d.SetLabels(map[string]string{"patched": "true"})
+				g.Expect(c.Patch(ctx, d, patch, client.DisableReadWriteConsistency)).To(Succeed())
+			},
+			read: get,
+		},
+		{
+			name: "Apply",
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				ac := appsv1applyconfigurations.Deployment(deployment().GetName(), namespace).
+					WithLabels(map[string]string{"applied": "true"})
+				g.Expect(c.Apply(ctx, ac, client.FieldOwner("test"), client.DisableReadWriteConsistency)).To(Succeed())
+			},
+			read: get,
+		},
+		{
+			name:            "Delete",
+			maybeInitObject: deployment,
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				g.Expect(c.Delete(ctx, deployment(), client.DisableReadWriteConsistency)).To(Succeed())
+			},
+			read: list,
+		},
+		{
+			name:            "Status Update",
+			maybeInitObject: deployment,
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				d := deployment()
+				d.Status.Replicas = 5
+				g.Expect(c.Status().Update(ctx, d, client.DisableReadWriteConsistency)).To(Succeed())
+			},
+			read: get,
+		},
+		{
+			name:            "Status Patch",
+			maybeInitObject: deployment,
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				d := deployment()
+				patch := client.MergeFrom(d.DeepCopyObject().(client.Object))
+				d.Status.Replicas = 6
+				g.Expect(c.Status().Patch(ctx, d, patch, client.DisableReadWriteConsistency)).To(Succeed())
+			},
+			read: get,
+		},
+		{
+			name:            "Status Apply",
+			maybeInitObject: deployment,
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				ac := appsv1applyconfigurations.Deployment(deployment().GetName(), namespace).
+					WithStatus(appsv1applyconfigurations.DeploymentStatus().WithReplicas(7))
+				g.Expect(c.Status().Apply(ctx, ac, client.FieldOwner("test"), client.DisableReadWriteConsistency)).To(Succeed())
+			},
+			read: get,
+		},
+		{
+			name:            "Scale Update",
+			maybeInitObject: deployment,
+			write: func(ctx context.Context, c client.Client, g *WithT) {
+				scale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 8}}
+				g.Expect(c.SubResource("scale").Update(ctx, deployment(), client.WithSubResourceBody(scale), client.DisableReadWriteConsistency)).To(Succeed())
+			},
+			read: get,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				g := NewWithT(t)
+
+				var initObjects []client.Object
+				if tc.maybeInitObject != nil {
+					initObjects = []client.Object{tc.maybeInitObject()}
+				}
+				c := newConsistentFakeClient(t, writebarrier.NewWriteBarrier(), initObjects...)
+				synctest.Wait() // wait for cache start to finish
+
+				tc.write(t.Context(), c, g)
+
+				start := time.Now()
+				tc.read(t.Context(), c, g)
+				g.Expect(time.Since(start)).To(BeZero())
+
+				// Let the pending cache event be delivered, the bubble can not
+				// end while a goroutine in it is still blocked.
+				time.Sleep(watchDelay)
+			})
+		})
+	}
+}
+
 // watchDelay is how long the fake cache lags behind the fake client.
 const watchDelay = 10 * time.Second
 
