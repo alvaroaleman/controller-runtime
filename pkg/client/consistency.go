@@ -224,10 +224,10 @@ func (c *consistentClient) Apply(ctx context.Context, obj runtime.ApplyConfigura
 	})
 }
 
-func writeTargetFor(obj any, scheme *runtime.Scheme) (schema.GroupVersionKind, types.NamespacedName, Object, func() (string, error), error) {
+func writeTargetFor(obj any, scheme *runtime.Scheme) (gvkAndRepresentation, types.NamespacedName, Object, func() (string, error), error) {
 	switch t := obj.(type) {
 	case *unstructuredApplyConfiguration:
-		return t.Unstructured.GroupVersionKind(),
+		return gvkAndRepresentation{gvk: t.Unstructured.GroupVersionKind(), representation: representationIDUnstructured},
 			ObjectKeyFromObject(t),
 			t.Unstructured,
 			func() (string, error) { return t.Unstructured.GetResourceVersion(), nil },
@@ -235,35 +235,41 @@ func writeTargetFor(obj any, scheme *runtime.Scheme) (schema.GroupVersionKind, t
 	case applyConfiguration:
 		gvk, err := gvkFromApplyConfiguration(t)
 		if err != nil {
-			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to get GVK for apply configuration %T: %w", obj, err)
+			return gvkAndRepresentation{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to get GVK for apply configuration %T: %w", obj, err)
 		}
 		cacheObj, err := scheme.New(gvk)
 		if err != nil {
-			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to create object for GVK %s: %w", gvk, err)
+			return gvkAndRepresentation{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to create object for GVK %s: %w", gvk, err)
 		}
 		clientObj, ok := cacheObj.(Object)
 		if !ok {
-			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("object of type %T for GVK %s does not implement client.Object", cacheObj, gvk)
+			return gvkAndRepresentation{}, types.NamespacedName{}, nil, nil, fmt.Errorf("object of type %T for GVK %s does not implement client.Object", cacheObj, gvk)
 		}
 		clientObj.SetName(ptr.Deref(t.GetName(), ""))
 		clientObj.SetNamespace(ptr.Deref(t.GetNamespace(), ""))
-		return gvk,
+		return gvkAndRepresentation{gvk: gvk, representation: representationIDTyped},
 			ObjectKeyFromObject(clientObj),
 			clientObj,
 			func() (string, error) { return resourceVersionFromApplyConfiguration(t) },
 			nil
+	case *metav1.PartialObjectMetadata:
+		return gvkAndRepresentation{gvk: t.GroupVersionKind(), representation: representationIDPartialObjectMetadata},
+			ObjectKeyFromObject(t),
+			t,
+			func() (string, error) { return t.GetResourceVersion(), nil },
+			nil
 	case Object:
 		gvk, err := apiutil.GVKForObject(t, scheme)
 		if err != nil {
-			return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
+			return gvkAndRepresentation{}, types.NamespacedName{}, nil, nil, fmt.Errorf("failed to get GVK for object %T: %w", obj, err)
 		}
-		return gvk,
-			types.NamespacedName{Namespace: t.GetNamespace(), Name: t.GetName()},
+		return gvkAndRepresentation{gvk: gvk, representation: representationIDTyped},
+			ObjectKeyFromObject(t),
 			t,
 			func() (string, error) { return t.GetResourceVersion(), nil },
 			nil
 	default:
-		return schema.GroupVersionKind{}, types.NamespacedName{}, nil, nil, fmt.Errorf("unsupported type %T, must be either %T, %T or %T", obj, Object(nil), &unstructuredApplyConfiguration{}, applyConfiguration(nil))
+		return gvkAndRepresentation{}, types.NamespacedName{}, nil, nil, fmt.Errorf("unsupported type %T, must be either %T, %T or %T", obj, Object(nil), &unstructuredApplyConfiguration{}, applyConfiguration(nil))
 	}
 }
 
@@ -272,11 +278,10 @@ func (c *consistentClient) writeAndRecordRV(ctx context.Context, obj any, disabl
 		return write()
 	}
 
-	gvk, namespacedName, cacheObj, getResourceVersion, err := writeTargetFor(obj, c.upstream.Scheme())
+	gvkAndRepresentation, namespacedName, cacheObj, getResourceVersion, err := writeTargetFor(obj, c.upstream.Scheme())
 	if err != nil {
 		return err
 	}
-	gvkAndRepresentation := gvkAndRepresentation{gvk: gvk, representation: representationIDForObj(cacheObj)}
 
 	// We don't technically need an informer since the RV is monotonically increasing, but we want to fail
 	// ASAP if the cache can not be setup.
