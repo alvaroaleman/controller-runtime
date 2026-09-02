@@ -116,8 +116,8 @@ var _ = Describe("ConsistentClient", func() {
 				cl, err = client.New(cfg, client.Options{
 					Scheme: kscheme.Scheme,
 					Cache: &client.CacheOptions{
-						Reader:                             c,
-						ReadYourOwnWriteConsistencyEnabled: new(true),
+						Reader:                          c,
+						EnableReadYourWritesConsistency: new(true),
 					},
 				})
 				Expect(err).NotTo(HaveOccurred())

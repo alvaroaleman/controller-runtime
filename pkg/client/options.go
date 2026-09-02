@@ -200,69 +200,69 @@ func (f FieldOwner) ApplyToSubResourceApply(opts *SubResourceApplyOptions) {
 	opts.FieldManager = string(f)
 }
 
-// DisableReadWriteConsistency disables read-your-own-write consistency for the
+// DisableReadYourWritesConsistency disables read-your-own-write consistency for the
 // request it is passed to. It has no effect if the client was not configured with
-// CacheOptions.ReadYourOwnWriteConsistencyEnabled.
+// CacheOptions.ReadYourWritesConsistencyEnabled.
 //
 // On a read request, the request will not wait for the cache to have observed
 // previous writes. On a write request, subsequent read requests will not wait
 // for the cache to have observed this write.
-const DisableReadWriteConsistency = disableReadWriteConsistencyOption(true)
+const DisableReadYourWritesConsistency = disableReadYourWritesConsistency(true)
 
-type disableReadWriteConsistencyOption bool
+type disableReadYourWritesConsistency bool
 
 // ApplyToGet applies this configuration to the given get options.
-func (disableReadWriteConsistencyOption) ApplyToGet(opts *GetOptions) {
-	opts.DisableReadWriteConsistency = true
+func (disableReadYourWritesConsistency) ApplyToGet(opts *GetOptions) {
+	opts.DisableReadYourWritesConsistency = true
 }
 
 // ApplyToList applies this configuration to the given list options.
-func (disableReadWriteConsistencyOption) ApplyToList(opts *ListOptions) {
-	opts.DisableReadWriteConsistency = true
+func (disableReadYourWritesConsistency) ApplyToList(opts *ListOptions) {
+	opts.DisableReadYourWritesConsistency = true
 }
 
 // ApplyToCreate applies this configuration to the given create options.
-func (disableReadWriteConsistencyOption) ApplyToCreate(opts *CreateOptions) {
-	opts.DisableReadWriteConsistency = true
+func (disableReadYourWritesConsistency) ApplyToCreate(opts *CreateOptions) {
+	opts.DisableReadYourWritesConsistency = true
 }
 
 // ApplyToUpdate applies this configuration to the given update options.
-func (disableReadWriteConsistencyOption) ApplyToUpdate(opts *UpdateOptions) {
-	opts.DisableReadWriteConsistency = true
+func (disableReadYourWritesConsistency) ApplyToUpdate(opts *UpdateOptions) {
+	opts.DisableReadYourWritesConsistency = true
 }
 
 // ApplyToPatch applies this configuration to the given patch options.
-func (disableReadWriteConsistencyOption) ApplyToPatch(opts *PatchOptions) {
-	opts.DisableReadWriteConsistency = true
+func (disableReadYourWritesConsistency) ApplyToPatch(opts *PatchOptions) {
+	opts.DisableReadYourWritesConsistency = true
 }
 
 // ApplyToApply applies this configuration to the given apply options.
-func (disableReadWriteConsistencyOption) ApplyToApply(opts *ApplyOptions) {
-	opts.DisableReadWriteConsistency = true
+func (disableReadYourWritesConsistency) ApplyToApply(opts *ApplyOptions) {
+	opts.DisableReadYourWritesConsistency = true
 }
 
 // ApplyToDelete applies this configuration to the given delete options.
-func (disableReadWriteConsistencyOption) ApplyToDelete(opts *DeleteOptions) {
-	opts.DisableReadWriteConsistency = true
+func (disableReadYourWritesConsistency) ApplyToDelete(opts *DeleteOptions) {
+	opts.DisableReadYourWritesConsistency = true
 }
 
 // ApplyToSubResourceCreate applies this configuration to the given create options.
-func (d disableReadWriteConsistencyOption) ApplyToSubResourceCreate(opts *SubResourceCreateOptions) {
+func (d disableReadYourWritesConsistency) ApplyToSubResourceCreate(opts *SubResourceCreateOptions) {
 	d.ApplyToCreate(&opts.CreateOptions)
 }
 
 // ApplyToSubResourceUpdate applies this configuration to the given update options.
-func (d disableReadWriteConsistencyOption) ApplyToSubResourceUpdate(opts *SubResourceUpdateOptions) {
+func (d disableReadYourWritesConsistency) ApplyToSubResourceUpdate(opts *SubResourceUpdateOptions) {
 	d.ApplyToUpdate(&opts.UpdateOptions)
 }
 
 // ApplyToSubResourcePatch applies this configuration to the given patch options.
-func (d disableReadWriteConsistencyOption) ApplyToSubResourcePatch(opts *SubResourcePatchOptions) {
+func (d disableReadYourWritesConsistency) ApplyToSubResourcePatch(opts *SubResourcePatchOptions) {
 	d.ApplyToPatch(&opts.PatchOptions)
 }
 
 // ApplyToSubResourceApply applies this configuration to the given apply options.
-func (d disableReadWriteConsistencyOption) ApplyToSubResourceApply(opts *SubResourceApplyOptions) {
+func (d disableReadYourWritesConsistency) ApplyToSubResourceApply(opts *SubResourceApplyOptions) {
 	d.ApplyToApply(&opts.ApplyOptions)
 }
 
@@ -335,10 +335,10 @@ type CreateOptions struct {
 	// will contain all unknown and duplicate fields encountered.
 	FieldValidation string
 
-	// DisableReadWriteConsistency indicates that subsequent read requests will not
+	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this write. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourOwnWriteConsistencyEnabled.
-	DisableReadWriteConsistency bool
+	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw CreateOptions, as passed to the API server.
 	Raw *metav1.CreateOptions
@@ -380,8 +380,8 @@ func (o *CreateOptions) ApplyToCreate(co *CreateOptions) {
 	if o.FieldValidation != "" {
 		co.FieldValidation = o.FieldValidation
 	}
-	if o.DisableReadWriteConsistency {
-		co.DisableReadWriteConsistency = true
+	if o.DisableReadYourWritesConsistency {
+		co.DisableReadYourWritesConsistency = true
 	}
 	if o.Raw != nil {
 		co.Raw = o.Raw
@@ -417,10 +417,10 @@ type DeleteOptions struct {
 	// foreground.
 	PropagationPolicy *metav1.DeletionPropagation
 
-	// DisableReadWriteConsistency indicates that subsequent read requests will not
+	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this delete. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourOwnWriteConsistencyEnabled.
-	DisableReadWriteConsistency bool
+	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw DeleteOptions, as passed to the API server.
 	Raw *metav1.DeleteOptions
@@ -472,8 +472,8 @@ func (o *DeleteOptions) ApplyToDelete(do *DeleteOptions) {
 	if o.PropagationPolicy != nil {
 		do.PropagationPolicy = o.PropagationPolicy
 	}
-	if o.DisableReadWriteConsistency {
-		do.DisableReadWriteConsistency = true
+	if o.DisableReadYourWritesConsistency {
+		do.DisableReadYourWritesConsistency = true
 	}
 	if o.Raw != nil {
 		do.Raw = o.Raw
@@ -551,10 +551,10 @@ type GetOptions struct {
 	// +optional
 	UnsafeDisableDeepCopy *bool
 
-	// DisableReadWriteConsistency indicates that the request will not wait for the
+	// DisableReadYourWritesConsistency indicates that the request will not wait for the
 	// cache to have observed previous writes. It has no effect if the client was not
-	// configured with CacheOptions.ReadYourOwnWriteConsistencyEnabled.
-	DisableReadWriteConsistency bool
+	// configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	DisableReadYourWritesConsistency bool
 }
 
 var _ GetOption = &GetOptions{}
@@ -567,8 +567,8 @@ func (o *GetOptions) ApplyToGet(lo *GetOptions) {
 	if o.UnsafeDisableDeepCopy != nil {
 		lo.UnsafeDisableDeepCopy = o.UnsafeDisableDeepCopy
 	}
-	if o.DisableReadWriteConsistency {
-		lo.DisableReadWriteConsistency = true
+	if o.DisableReadYourWritesConsistency {
+		lo.DisableReadYourWritesConsistency = true
 	}
 }
 
@@ -628,10 +628,10 @@ type ListOptions struct {
 	// +optional
 	UnsafeDisableDeepCopy *bool
 
-	// DisableReadWriteConsistency indicates that the request will not wait for the
+	// DisableReadYourWritesConsistency indicates that the request will not wait for the
 	// cache to have observed previous writes. It has no effect if the client was not
-	// configured with CacheOptions.ReadYourOwnWriteConsistencyEnabled.
-	DisableReadWriteConsistency bool
+	// configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw ListOptions, as passed to the API server.  Note
 	// that these may not be respected by all implementations of interface,
@@ -663,6 +663,10 @@ func (o *ListOptions) ApplyToList(lo *ListOptions) {
 	}
 	if o.UnsafeDisableDeepCopy != nil {
 		lo.UnsafeDisableDeepCopy = o.UnsafeDisableDeepCopy
+	}
+
+	if o.DisableReadYourWritesConsistency {
+		lo.DisableReadYourWritesConsistency = true
 	}
 }
 
@@ -892,10 +896,10 @@ type UpdateOptions struct {
 	// will contain all unknown and duplicate fields encountered.
 	FieldValidation string
 
-	// DisableReadWriteConsistency indicates that subsequent read requests will not
+	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this write. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourOwnWriteConsistencyEnabled.
-	DisableReadWriteConsistency bool
+	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw UpdateOptions, as passed to the API server.
 	Raw *metav1.UpdateOptions
@@ -939,8 +943,8 @@ func (o *UpdateOptions) ApplyToUpdate(uo *UpdateOptions) {
 	if o.FieldValidation != "" {
 		uo.FieldValidation = o.FieldValidation
 	}
-	if o.DisableReadWriteConsistency {
-		uo.DisableReadWriteConsistency = true
+	if o.DisableReadYourWritesConsistency {
+		uo.DisableReadYourWritesConsistency = true
 	}
 	if o.Raw != nil {
 		uo.Raw = o.Raw
@@ -988,10 +992,10 @@ type PatchOptions struct {
 	// will contain all unknown and duplicate fields encountered.
 	FieldValidation string
 
-	// DisableReadWriteConsistency indicates that subsequent read requests will not
+	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this write. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourOwnWriteConsistencyEnabled.
-	DisableReadWriteConsistency bool
+	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw PatchOptions, as passed to the API server.
 	Raw *metav1.PatchOptions
@@ -1047,8 +1051,8 @@ func (o *PatchOptions) ApplyToPatch(po *PatchOptions) {
 	if o.FieldValidation != "" {
 		po.FieldValidation = o.FieldValidation
 	}
-	if o.DisableReadWriteConsistency {
-		po.DisableReadWriteConsistency = true
+	if o.DisableReadYourWritesConsistency {
+		po.DisableReadYourWritesConsistency = true
 	}
 	if o.Raw != nil {
 		po.Raw = o.Raw
@@ -1132,10 +1136,10 @@ type ApplyOptions struct {
 	// +required
 	FieldManager string
 
-	// DisableReadWriteConsistency indicates that subsequent read requests will not
+	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this write. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourOwnWriteConsistencyEnabled.
-	DisableReadWriteConsistency bool
+	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	DisableReadYourWritesConsistency bool
 }
 
 // ApplyOptions applies the given opts onto the ApplyOptions
@@ -1159,8 +1163,8 @@ func (o *ApplyOptions) ApplyToApply(opts *ApplyOptions) {
 		opts.FieldManager = o.FieldManager
 	}
 
-	if o.DisableReadWriteConsistency {
-		opts.DisableReadWriteConsistency = true
+	if o.DisableReadYourWritesConsistency {
+		opts.DisableReadYourWritesConsistency = true
 	}
 }
 

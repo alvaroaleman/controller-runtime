@@ -364,7 +364,7 @@ func TestConsistentFakeClient(t *testing.T) {
 	}
 }
 
-func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
+func TestConsistentFakeClientDisableReadYourWritesConsistency(t *testing.T) {
 	t.Parallel()
 
 	const namespace = "default"
@@ -396,7 +396,7 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 			},
 			read: func(ctx context.Context, c client.Client, g *WithT) {
 				d := deployment()
-				g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d, client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.Get(ctx, client.ObjectKeyFromObject(d), d, client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 		},
 		{
@@ -405,13 +405,13 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 				g.Expect(c.Create(ctx, deployment())).To(Succeed())
 			},
 			read: func(ctx context.Context, c client.Client, g *WithT) {
-				g.Expect(c.List(ctx, &appsv1.DeploymentList{}, client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.List(ctx, &appsv1.DeploymentList{}, client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 		},
 		{
 			name: "Create",
 			write: func(ctx context.Context, c client.Client, g *WithT) {
-				g.Expect(c.Create(ctx, deployment(), client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.Create(ctx, deployment(), client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 			read: get,
 		},
@@ -421,7 +421,7 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 			write: func(ctx context.Context, c client.Client, g *WithT) {
 				d := deployment()
 				d.SetLabels(map[string]string{"updated": "true"})
-				g.Expect(c.Update(ctx, d, client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.Update(ctx, d, client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 			read: get,
 		},
@@ -432,7 +432,7 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 				d := deployment()
 				patch := client.MergeFrom(d.DeepCopyObject().(client.Object))
 				d.SetLabels(map[string]string{"patched": "true"})
-				g.Expect(c.Patch(ctx, d, patch, client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.Patch(ctx, d, patch, client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 			read: get,
 		},
@@ -441,7 +441,7 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 			write: func(ctx context.Context, c client.Client, g *WithT) {
 				ac := appsv1applyconfigurations.Deployment(deployment().GetName(), namespace).
 					WithLabels(map[string]string{"applied": "true"})
-				g.Expect(c.Apply(ctx, ac, client.FieldOwner("test"), client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.Apply(ctx, ac, client.FieldOwner("test"), client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 			read: get,
 		},
@@ -449,7 +449,7 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 			name:            "Delete",
 			maybeInitObject: deployment,
 			write: func(ctx context.Context, c client.Client, g *WithT) {
-				g.Expect(c.Delete(ctx, deployment(), client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.Delete(ctx, deployment(), client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 			read: list,
 		},
@@ -459,7 +459,7 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 			write: func(ctx context.Context, c client.Client, g *WithT) {
 				d := deployment()
 				d.Status.Replicas = 5
-				g.Expect(c.Status().Update(ctx, d, client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.Status().Update(ctx, d, client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 			read: get,
 		},
@@ -470,7 +470,7 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 				d := deployment()
 				patch := client.MergeFrom(d.DeepCopyObject().(client.Object))
 				d.Status.Replicas = 6
-				g.Expect(c.Status().Patch(ctx, d, patch, client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.Status().Patch(ctx, d, patch, client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 			read: get,
 		},
@@ -480,7 +480,7 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 			write: func(ctx context.Context, c client.Client, g *WithT) {
 				ac := appsv1applyconfigurations.Deployment(deployment().GetName(), namespace).
 					WithStatus(appsv1applyconfigurations.DeploymentStatus().WithReplicas(7))
-				g.Expect(c.Status().Apply(ctx, ac, client.FieldOwner("test"), client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.Status().Apply(ctx, ac, client.FieldOwner("test"), client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 			read: get,
 		},
@@ -489,7 +489,7 @@ func TestConsistentFakeClientDisableReadWriteConsistency(t *testing.T) {
 			maybeInitObject: deployment,
 			write: func(ctx context.Context, c client.Client, g *WithT) {
 				scale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 8}}
-				g.Expect(c.SubResource("scale").Update(ctx, deployment(), client.WithSubResourceBody(scale), client.DisableReadWriteConsistency)).To(Succeed())
+				g.Expect(c.SubResource("scale").Update(ctx, deployment(), client.WithSubResourceBody(scale), client.DisableReadYourWritesConsistency)).To(Succeed())
 			},
 			read: get,
 		},

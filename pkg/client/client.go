@@ -94,11 +94,11 @@ type CacheOptions struct {
 	// If false, unstructured objects will always result in a live lookup.
 	Unstructured bool
 
-	// ReadYourOwnWriteConsistencyEnabled controls if read requests against the cache will
+	// EnableReadYourWritesConsistency controls if read requests against the cache will
 	// block until the cache observed all write requests that started before the read
 	// request. Lists will wait for all pending write requests to the gvk the List is for.
 	//
-	// The `DisableReadWriteConsistency` option can be used to disable this functionality
+	// The `DisableReadYourWritesConsistency` option can be used to disable this functionality
 	// for individual requests, both on reads to keep them from waiting and on writes to
 	// prevent them from blocking subsequent reads.
 	//
@@ -109,7 +109,7 @@ type CacheOptions struct {
 	// how exactly it works and how exactly it is configured may change.
 	//
 	// Defaults to false.
-	ReadYourOwnWriteConsistencyEnabled *bool
+	EnableReadYourWritesConsistency *bool
 }
 
 // NewClientFunc allows a user to define how to create a client.
@@ -257,13 +257,13 @@ func newClient(config *rest.Config, options Options) (*client, Client, error) {
 		c.uncachedGVKs[gvk] = struct{}{}
 	}
 
-	if !ptr.Deref(options.Cache.ReadYourOwnWriteConsistencyEnabled, false) {
+	if !ptr.Deref(options.Cache.EnableReadYourWritesConsistency, false) {
 		return c, c, nil
 	}
 
 	informerCache, isCache := options.Cache.Reader.(cacheapi.Informers)
 	if !isCache {
-		return nil, nil, fmt.Errorf("cache reader does not implement %T, can not provide ReadYourOwnWriteConsistency", cacheapi.Informers(nil))
+		return nil, nil, fmt.Errorf("cache reader does not implement %T, can not provide ReadYourWritesConsistency", cacheapi.Informers(nil))
 	}
 
 	return c, newConsistentClient(
