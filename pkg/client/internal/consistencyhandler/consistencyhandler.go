@@ -205,7 +205,7 @@ func (h *ConsistencyHandler) waitDeletes(ctx context.Context, uids sets.Set[type
 	for {
 		// must store the chan before checking the deletes to guarantee that even if the deletes
 		// get  updated after our check and before the select, we still get an event.
-		updatedChan := h.pendingDeletesBroadcaster.wait()
+		updatedChan := h.pendingDeletesBroadcaster.getWaitChan()
 		done := h.allDeleted(uids)
 		if done {
 			return nil
@@ -243,7 +243,7 @@ func (h *ConsistencyHandler) waitForRV(ctx context.Context, rv int64) error {
 	for {
 		// must store the chan before checking the RV to guarantee that even if the RV
 		// gets updated after our check and before the select, we still get an event.
-		updatedChan := h.rvBroadCaster.wait()
+		updatedChan := h.rvBroadCaster.getWaitChan()
 		if h.observedRV.Load() >= rv {
 			return nil
 		}
@@ -326,14 +326,14 @@ type broadcaster struct {
 func (b *broadcaster) broadcast() {
 	b.lock.Lock()
 	defer b.lock.Unlock()
-	// Lazily create the channel in wait to avoid creating a channel per event.
+	// Lazily create the channel in getWaitChan to avoid creating a channel per event.
 	if b.ch != nil {
 		close(b.ch)
 		b.ch = nil
 	}
 }
 
-func (b *broadcaster) wait() <-chan struct{} {
+func (b *broadcaster) getWaitChan() <-chan struct{} {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 
