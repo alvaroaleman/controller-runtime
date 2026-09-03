@@ -202,7 +202,7 @@ func (f FieldOwner) ApplyToSubResourceApply(opts *SubResourceApplyOptions) {
 
 // DisableReadYourWritesConsistency disables read-your-own-write consistency for the
 // request it is passed to. It has no effect if the client was not configured with
-// CacheOptions.ReadYourWritesConsistencyEnabled.
+// CacheOptions.EnableReadYourWritesConsistency.
 //
 // On a read request, the request will not wait for the cache to have observed
 // previous writes. On a write request, subsequent read requests will not wait
@@ -337,7 +337,7 @@ type CreateOptions struct {
 
 	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this write. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	// was not configured with CacheOptions.EnableReadYourWritesConsistency.
 	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw CreateOptions, as passed to the API server.
@@ -419,7 +419,7 @@ type DeleteOptions struct {
 
 	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this delete. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	// was not configured with CacheOptions.EnableReadYourWritesConsistency.
 	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw DeleteOptions, as passed to the API server.
@@ -553,7 +553,7 @@ type GetOptions struct {
 
 	// DisableReadYourWritesConsistency indicates that the request will not wait for the
 	// cache to have observed previous writes. It has no effect if the client was not
-	// configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	// configured with CacheOptions.EnableReadYourWritesConsistency.
 	DisableReadYourWritesConsistency bool
 }
 
@@ -630,7 +630,7 @@ type ListOptions struct {
 
 	// DisableReadYourWritesConsistency indicates that the request will not wait for the
 	// cache to have observed previous writes. It has no effect if the client was not
-	// configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	// configured with CacheOptions.EnableReadYourWritesConsistency.
 	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw ListOptions, as passed to the API server.  Note
@@ -898,7 +898,7 @@ type UpdateOptions struct {
 
 	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this write. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	// was not configured with CacheOptions.EnableReadYourWritesConsistency.
 	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw UpdateOptions, as passed to the API server.
@@ -994,7 +994,7 @@ type PatchOptions struct {
 
 	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this write. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	// was not configured with CacheOptions.EnableReadYourWritesConsistency.
 	DisableReadYourWritesConsistency bool
 
 	// Raw represents raw PatchOptions, as passed to the API server.
@@ -1138,7 +1138,7 @@ type ApplyOptions struct {
 
 	// DisableReadYourWritesConsistency indicates that subsequent read requests will not
 	// wait for the cache to have observed this write. It has no effect if the client
-	// was not configured with CacheOptions.ReadYourWritesConsistencyEnabled.
+	// was not configured with CacheOptions.EnableReadYourWritesConsistency.
 	DisableReadYourWritesConsistency bool
 }
 
